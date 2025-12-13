@@ -454,16 +454,61 @@ def imread(path, chn='rgb', dtype='float32', force_gray2rgb=True, force_rgba2rgb
     out:
         im: h x w x c, numpy tensor
     '''
+    # First attempt: OpenCV
+    im = None
     try:
         im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)  # BGR, uint8
-    except:
-        print(str(path))
+    except Exception:
+        # fall through to alternative backends
+        pass
+
+    # Fallback 1: PIL
+    if im is None:
+        try:
+            from PIL import Image
+            pil_img = Image.open(str(path))
+            # Convert channel order according to request later; keep RGB(A) here
+            if chn.lower() == 'gray':
+                pil_img = pil_img.convert('L')
+                im = np.array(pil_img)
+            else:
+                # keep RGB or RGBA, convert to numpy
+                pil_img = pil_img.convert('RGBA') if pil_img.mode == 'LA' else pil_img.convert('RGB')
+                im = np.array(pil_img)
+                # PIL gives RGB; convert to BGR to be consistent with OpenCV branch prior to later rgb/bgr swap
+                if im.ndim == 3 and im.shape[2] >= 3:
+                    im = rgb2bgr(im)
+        except Exception:
+            im = None
+
+    # Fallback 2: imageio
+    if im is None:
+        try:
+            import imageio.v2 as imageio
+            im_tmp = imageio.imread(str(path))
+            # imageio returns RGB for color images
+            if im_tmp.ndim == 2:
+                im = im_tmp
+            elif im_tmp.ndim >= 3:
+                # ensure HWC and take first 3 channels if more
+                if im_tmp.shape[-1] > 3:
+                    im_tmp = im_tmp[..., :3]
+                # convert RGB to BGR to match OpenCV branch before later swap
+                im = rgb2bgr(im_tmp)
+        except Exception:
+            im = None
 
     if im is None:
-        print(str(path))
+        # Provide a clear error for callers to handle
+        raise FileNotFoundError(f"Cannot read image at {str(path)}")
 
     if chn.lower() == 'gray':
-        assert im.ndim == 2, f"{str(path)} can't be successfuly read!"
+        if im.ndim != 2:
+            # convert color to gray
+            if im.ndim == 3 and im.shape[2] >= 3:
+                im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+            else:
+                raise ValueError(f"{str(path)} has unexpected shape for gray conversion: {getattr(im, 'shape', None)}")
     else:
         if im.ndim == 2:
             if force_gray2rgb:

@@ -175,3 +175,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+output/
+save_dir/
+weights/
+hub/

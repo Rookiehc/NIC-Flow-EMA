@@ -19,7 +19,7 @@ sliced_vae: False
 cfg_scale: 1.0
 
 # sampling settings 
-start_timesteps: 250
+start_timesteps: 200
 
 # color fixing
 color_fix: ~
@@ -41,11 +41,11 @@ model_start:
   params:
     in_channels: 3
     down_block_types:
-      - DownBlock2D       # 去掉一层注意力AttnDownBlock2D，改为普通卷积下采样DownBlock2D
+      - AttnDownBlock2D
       - AttnDownBlock2D
     up_block_types:
       - AttnUpBlock2D
-      - UpBlock2D          # 去掉一层注意力AttnUpBlock2D，改为普通卷积上采样UpBlock2D 
+      - AttnUpBlock2D
     block_out_channels:
       - 256    # 192, 256
       - 512    # 384, 512
@@ -68,13 +68,12 @@ model_middle:
   target: diffusers.models.autoencoders.NoisePredictor
   params:
     in_channels: 3
-    # 模型结构需要和训练时刻的保持一致
     down_block_types:
-      - DownBlock2D       # 去掉一层注意力AttnDownBlock2D，改为普通卷积下采样DownBlock2D
+      - AttnDownBlock2D
       - AttnDownBlock2D
     up_block_types:
       - AttnUpBlock2D
-      - UpBlock2D          # 去掉一层注意力AttnUpBlock2D，改为普通卷积上采样UpBlock2D 
+      - AttnUpBlock2D
     block_out_channels:
       - 256    # 192, 256
       - 512    # 384, 512

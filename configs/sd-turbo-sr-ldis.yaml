@@ -7,6 +7,7 @@ sd_pipe:
   enable_grad_checkpoint: True
   compile: False
   vae_split: 8
+  offload_vae_to_cpu: True  # optional CPU offload to save VRAM (slower)
   params:
     pretrained_model_name_or_path: stabilityai/sd-turbo
     cache_dir: weights
@@ -38,11 +39,11 @@ model:
   params:
     in_channels: 3
     down_block_types:
-      - AttnDownBlock2D
+      - DownBlock2D       # 去掉一层注意力AttnDownBlock2D，改为普通卷积下采样DownBlock2D
       - AttnDownBlock2D
     up_block_types:
       - AttnUpBlock2D
-      - AttnUpBlock2D
+      - UpBlock2D          # 去掉一层注意力AttnUpBlock2D，改为普通卷积上采样UpBlock2D 
     block_out_channels:
       - 256      # 192, 256
       - 512      # 384, 512
@@ -52,7 +53,7 @@ model:
     act_fn: silu
     latent_channels: 4
     norm_num_groups: 32
-    sample_size: 128
+    sample_size: 64 # 512/8=64，保持与gt_size=512一致
     mid_block_add_attention: True
     resnet_time_scale_shift: default
     temb_channels: 512
@@ -151,7 +152,7 @@ degradation:
   gray_noise_prob2: 0.4
   jpeg_range2: [30, 95]
 
-  gt_size: 512 
+  gt_size: 512  # 训练GT分辨率回到512
   resize_back: False
   use_sharp: False
 
@@ -161,18 +162,27 @@ data:
     params:
       data_source: 
         source1:
-          root_path: /mnt/sfs-common/zsyue/database/FFHQ
-          image_path: images1024
+          root_path: /data/yhc/imm_train_datasets
+          image_path: img512
           moment_path: ~
           text_path: ~
-          im_ext: png
-          length: 20000
+          im_ext: JPEG
+          length: ~    # 20000
         source2:
-          root_path: /mnt/sfs-common/zsyue/database/LSDIR/train
-          image_path: images 
+          root_path: /data/yhc/LSDIR
+          image_path: train_hr 
           moment_path: ~
           text_path: ~
           im_ext: png
+        # 新增的第三个训练数据源（CelebA-HQ 示例）
+        # 注意：请根据你的数据实际路径和扩展名调整 root_path / image_path / im_ext / length
+        source3:
+          root_path: /data/yhc/
+          image_path: FFHQ_s
+          moment_path: ~
+          text_path: ~
+          im_ext: JPEG   # CelebA-HQ 通常为 jpg/jpeg，如为 png 请改为 PNG
+          length: ~      # 使用全部样本，若需固定采样量可设定具体数值
       max_token_length: 77   # 77
       io_backend:
         type: disk
@@ -198,22 +208,24 @@ data:
       use_hflip: True
       use_rot: False
       random_crop: True
+      recursive: True
+
   val:
     type: base
     params:
-      dir_path: /mnt/sfs-common/zsyue/projects/DifInv/SR/testingdata/imagenet512/lq
+      dir_path: /data/yhc/imm_val_datasets/img128
       transform_type: default
       transform_kwargs:
           mean: 0.0
           std: 1.0
-      extra_dir_path: /mnt/sfs-common/zsyue/projects/DifInv/SR/testingdata/imagenet512/gt
+      extra_dir_path: /data/yhc/imm_val_datasets/img512  # ~
       extra_transform_type: default
       extra_transform_kwargs:
           mean: 0.0
           std: 1.0
       im_exts: png
-      length: 16
-      recursive: False
+      length: 32
+      recursive: True
 
 train:
   # predict started inverser
@@ -226,11 +238,12 @@ train:
   # discriminator
   lr_dis: 5e-5                  # learning rate for dicriminator
   weight_decay_dis: 1e-3        # weight decay for dicriminator
-  dis_init_iterations: 10000    # iterations used for updating the discriminator
+  dis_init_iterations: 10000   # iterations used for updating the discriminator  10000 
   dis_update_freq: 1            
   # dataloader
-  batch: 64               
-  microbatch: 16 
+  batch: 8  # 64         
+  microbatch: 2   #  16  降低显存占用：逐步可尝试 1→2→4
+  sd_microbatch: 2 # 2
   num_workers: 4
   prefetch_factor: 2            
   use_text: True
@@ -239,14 +252,17 @@ train:
   ema_rate: 0.999
   iterations: 200000            # total iterations
   # logging
-  save_freq: 5000
-  log_freq: [200, 5000]         # [training loss, training images, val images]
+  save_freq: 5000    # 5000
+  log_freq: [200, 5000]        # [training loss, training images, val images] [200, 5000] 
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging
   # loss 
   loss_type: L2
   loss_coef:
     ldif: 1.0
+    ldis: 0.1
+    llpips: 2.0
+    lhr: 0.05           # base weight for HR loss（将通过 loss_coef_schedule 在 2k/5k 后动态调整）
   timesteps: [250, 200, 150, 100]
   num_inference_steps: 5
   # mixed precision
@@ -256,9 +272,48 @@ train:
   seed: 123456                 
   global_seeding: False
   noise_detach: False
+  # Extra HR image-space comparison loss (standalone metric; not added into optimization loss)
+  extra_hr_loss_enable: False        # set False to disable computing image-space HR loss，占用显存过大，放弃
+  extra_hr_loss_type: L1            # L1 or L2 (MSE)
+  # HR image-space loss scheduling (compute lhr only every N iterations)
+  hr_loss_interval: 10              # compute HR loss & decode every 10 iterations; set 1 for every iteration
+  hr_loss_start: 0                  # first iteration to start applying HR loss
+  hr_loss_stop: ~                   # optional last iteration; keep ~ (None) for entire training
+  reuse_decoded_for_logging: True   # reuse decoded image for logging to avoid a second VAE decode
+  hr_loss_empty_cache: False        # call torch.cuda.empty_cache() after HR loss (can slow training)
+
+  # Latent-space enhanced HR loss (alternative to image-space; set latent_hr_loss_enable: True & extra_hr_loss_enable: False)
+  latent_hr_loss_enable: True       # if True, compute composite latent HR loss variants
+  latent_hr_loss_type: charbonnier  # one of: charbonnier | L1 | L2
+  latent_hr_charb_eps: 2e-3         # epsilon for Charbonnier（提高鲁棒性，减小早期尖峰）
+  latent_hr_multiscales: [1, 2]     # additional average-pooling scales; 1 means original resolution only
+  latent_hr_direction_weight: 0.2   # weight for direction (cosine) loss
+  latent_hr_grad_weight: 0.1        # weight for spatial gradient consistency
+  latent_hr_freq_weight: 0.05       # weight for Laplacian high-frequency emphasis
+  latent_hr_log_components: True    # stash component scalars for potential logging
+  latent_hr_dir_min_norm: 0.05      # 最小方向强度阈值，小于该阈值时不计入 direction loss
+  # Iteration-based schedule to ramp latent HR component weights (overrides static weights when present)
+  # Each entry: {iter: int, direction: float, grad: float, freq: float}
+  latent_hr_schedule:
+    - {iter: 0, direction: 0.0, grad: 0.0, freq: 0.0}
+    - {iter: 2000, direction: 0.2, grad: 0.05, freq: 0.02}
+    - {iter: 10000, direction: 0.25, grad: 0.08, freq: 0.04}
+
+  # Loss coefficient schedule（动态调整 lhr 与 llpips）：
+  #  - 2000 迭代后提升 lhr 到 0.1
+  #  - 5000 迭代后将 llpips 提升到 2.5
+  loss_coef_schedule:
+    - {iter: 2000, lhr: 0.10}
+    - {iter: 5000, llpips: 2.5}
+  # IMM-style one-step training controls
+  # always use this diffusion timestep as the denoising start (match IMM one-step);
+  # keep 250 to preserve the original InvSR fusion-at-t=250 behavior，修改一步时间步可以修改训练实际使用
+  imm_fixed_timestep: 250
+  # repeat sampling count per batch to stabilize one-step training; averaged for loss
+  sample_repeat: 1
 
 validate:
-  batch: 2
+  batch: 1  # 验证阶段也尽量小批次，降低显存峰值
   use_ema: True            
   log_freq: 4      # logging frequence
   val_y_channel: True

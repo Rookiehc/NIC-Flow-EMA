@@ -208,7 +208,7 @@ class DepsTableUpdateCommand(Command):
 extras = {}
 extras["quality"] = deps_list("urllib3", "isort", "ruff", "hf-doc-builder")
 extras["docs"] = deps_list("hf-doc-builder")
-extras["training"] = deps_list("accelerate", "datasets", "protobuf", "tensorboard", "Jinja2", "peft")
+extras["training"] = deps_list( "datasets", "protobuf", "tensorboard", "Jinja2", "peft") #"accelerate",
 extras["test"] = deps_list(
     "compel",
     "GitPython",
@@ -228,7 +228,7 @@ extras["test"] = deps_list(
     "torchvision",
     "transformers",
 )
-extras["torch"] = deps_list("torch", "accelerate")
+extras["torch"] = deps_list("torch", "accelerate") #, "accelerate"
 
 if os.name == "nt":  # windows
     extras["flax"] = []  # jax is not supported on windows

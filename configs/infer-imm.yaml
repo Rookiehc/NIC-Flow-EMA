@@ -1,0 +1,85 @@
+# IMM inference config for InvSR with SD-Turbo backbone
+
+# Base model selection (keep consistent with training)
+base_model: sd-turbo
+
+# Stable Diffusion / SD-Turbo pipeline
+sd_pipe:
+  target: diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline
+  num_train_steps: 1000
+  enable_grad_checkpoint: True
+  compile: False
+  vae_split: 1
+  offload_vae_to_cpu: False
+  params:
+    pretrained_model_name_or_path: stabilityai/sd-turbo
+    cache_dir: weights
+    use_safetensors: True
+    torch_dtype: torch.float16
+
+# Optional improved VAE (fp16). If you don't have this locally, you can remove this block.
+vae_fp16:
+  target: diffusers.models.autoencoders.AutoencoderKL
+  params:
+    pretrained_model_name_or_path: weights/vae_fp16
+    torch_dtype: torch.float16
+
+# Inference-time options (read by inference_invsr.py)
+bs: 1
+chopping_bs: 8
+cfg_scale: 1.0
+seed: 123456
+
+# VAE/attention memory optimizations
+sliced_vae: True
+tiled_vae: True
+enable_unet_gradient_checkpointing: True
+enable_attention_slicing: True
+use_xformers: True
+
+# Color fix options: '', 'wavelet', or 'ycbcr'
+color_fix: ''
+
+# BaseSR chopping parameters (used by sampler during tiling)
+basesr:
+  chopping:
+    pch_size: 128
+    extra_bs: 8
+  sf: 4
+
+# Default timesteps used when not provided via CLI. These are typical for sd-turbo-style inverse steps.
+# You can override via `--timesteps` or `--num_steps` in the command line.
+timesteps: [250, 200, 150, 100]
+
+# Optional: reference stats for FID (can be overridden via CLI `--fid_ref`)
+fid_ref_stats: ~
+
+# Start Noise Predictor configuration (与训练配置保持一致)
+model_start:
+  target: diffusers.models.autoencoders.NoisePredictor
+  ckpt_path: weights/noise_predictor_sd_turbo_v5.pth
+  params:
+    in_channels: 3
+    down_block_types:
+      - DownBlock2D
+      - AttnDownBlock2D
+    up_block_types:
+      - AttnUpBlock2D
+      - UpBlock2D
+    block_out_channels:
+      - 256
+      - 512
+    layers_per_block:
+      - 3
+      - 3
+    act_fn: silu
+    latent_channels: 4
+    norm_num_groups: 32
+    sample_size: 64
+    mid_block_add_attention: True
+    resnet_time_scale_shift: default
+    temb_channels: 512
+    attention_head_dim: 64
+    freq_shift: 0
+    flip_sin_to_cos: True
+    double_z: True

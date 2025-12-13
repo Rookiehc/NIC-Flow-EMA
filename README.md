@@ -78,6 +78,30 @@ docker compose up -d # Go to http://127.0.0.1:7860/
 
 + To reproduce the quantitative results on Imagenet-Test and RealSRV3, please add the color fixing options by ``--color_fix wavelet``.
 
+## 启用严格评估 (Strict evaluation)
+
+如果你想在推理后计算严格的指标（例如 PSNR / SSIM / LPIPS / NIQE / PI / CLIP-IQA / MUSIQ），请按下面步骤操作：
+
+1. 在环境中安装额外依赖（推荐在已创建的 conda 环境中使用 pip）：
+
+```
+conda activate invsr
+pip install piq==0.3.0
+```
+
+2. 运行推理并启用严格评估标志：
+
+```
+python inference_invsr.py -i [image_folder] -o [result_folder] --num_steps 1 --strict_metrics true
+```
+
+3. 说明与回退策略：
+    - 我们的严格评估脚本优先使用 `piq` 实现的指标（PI、CLIP-IQA、MUSIQ、LPIPS 等）；若未安装 `piq`，脚本会回退到已实现的基线计算（例如基于 `latent_lpips` 的 LPIPS 与 `scikit-image` 的 SSIM/NIQE）。
+    - `piq` 与你的 PyTorch / CUDA 版本需要兼容（推荐与仓库中 `environment.yaml` 的 PyTorch 版本一致，例如 `torch==2.4.0+cu121`）。若出现兼容性问题，请参考 `piq` 的安装说明或在虚拟环境中单独安装匹配的 PyTorch 版本。
+
+如果你希望我把 `piq` 也加入 `requirements.txt` 或者把更多可选的严格指标（例如单独安装 MUSIQ 的实现）加入到环境配置里，我可以继续为你把这些项补齐并给出安装建议。
+
+
 ## Training
 ### :turtle: Preparing stage
 1. Download the finetuned LPIPS model from this [link](https://huggingface.co/OAOA/InvSR/resolve/main/vgg16_sdturbo_lpips.pth?download=true) and put it in the folder of "weights".

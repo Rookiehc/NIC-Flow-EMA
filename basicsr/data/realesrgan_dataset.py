@@ -63,31 +63,50 @@ class RealESRGANDataset(data.Dataset):
         self.text_paths = []
         self.moment_paths = []
         if opt.get('data_source', None) is not None:
+            recursive = bool(opt.get('recursive', False))
             for ii in range(len(opt['data_source'])):
                 configs = opt['data_source'].get(f'source{ii+1}')
                 root_path = Path(configs.root_path)
                 im_folder = root_path / configs.image_path
                 im_ext = configs.im_ext
-                image_stems = sorted([x.stem for x in im_folder.glob(f"*.{im_ext}")])
-                if configs.get('length', None) is not None:
-                    assert configs.length < len(image_stems)
-                    image_stems = image_stems[:configs.length]
 
-                if configs.get("text_path", None) is not None:
-                    text_folder = root_path / configs.text_path
-                    text_stems = [x.stem for x in text_folder.glob("*.txt")]
-                    image_stems = sorted(list(set(image_stems).intersection(set(text_stems))))
-                    self.text_paths.extend([str(text_folder / f"{x}.txt") for x in image_stems])
+                has_meta = (configs.get('text_path', None) is not None) or (configs.get('moment_path', None) is not None)
+
+                if has_meta:
+                    # Keep stem-based matching to align with text/moment files
+                    files = sorted(list(im_folder.glob(f"*.{im_ext}")))
+                    image_stems = [x.stem for x in files]
+                    req_len = configs.get('length', None)
+                    if req_len is not None:
+                        # clip instead of assert
+                        req_len = min(int(req_len), len(image_stems))
+                        image_stems = image_stems[:req_len]
+
+                    if configs.get("text_path", None) is not None:
+                        text_folder = root_path / configs.text_path
+                        text_stems = [x.stem for x in text_folder.glob("*.txt")]
+                        image_stems = sorted(list(set(image_stems).intersection(set(text_stems))))
+                        self.text_paths.extend([str(text_folder / f"{x}.txt") for x in image_stems])
+                    else:
+                        self.text_paths.extend([None, ] * len(image_stems))
+
+                    self.image_paths.extend([str(im_folder / f"{x}.{im_ext}") for x in image_stems])
+
+                    if configs.get("moment_path", None) is not None:
+                        moment_folder = root_path / configs.moment_path
+                        self.moment_paths.extend([str(moment_folder / f"{x}.npy") for x in image_stems])
+                    else:
+                        self.moment_paths.extend([None, ] * len(image_stems))
                 else:
-                    self.text_paths.extend([None, ] * len(image_stems))
-
-                self.image_paths.extend([str(im_folder / f"{x}.{im_ext}") for x in image_stems])
-
-                if configs.get("moment_path", None) is not None:
-                    moment_folder = root_path / configs.moment_path
-                    self.moment_paths.extend([str(moment_folder / f"{x}.npy") for x in image_stems])
-                else:
-                    self.moment_paths.extend([None, ] * len(image_stems))
+                    # Pure image loading; support recursive directory scanning (e.g., ImageNet-style folders)
+                    files = sorted(list(im_folder.rglob(f"*.{im_ext}"))) if recursive else sorted(list(im_folder.glob(f"*.{im_ext}")))
+                    req_len = configs.get('length', None)
+                    if req_len is not None:
+                        req_len = min(int(req_len), len(files))
+                        files = files[:req_len]
+                    self.image_paths.extend([str(x) for x in files])
+                    self.text_paths.extend([None, ] * len(files))
+                    self.moment_paths.extend([None, ] * len(files))
 
         # blur settings for the first degradation
         self.blur_kernel_size = opt['blur_kernel_size']
@@ -170,7 +189,14 @@ class RealESRGANDataset(data.Dataset):
                     self.center_cropper = albumentations.CenterCrop(gt_size, gt_size)
                 img_gt = self.center_cropper(image=img_gt)['image']
             else:
-                img_gt = random_crop(img_gt, self.opt['gt_size'])
+                # ensure the image is large enough for random crop; if not, upscale shortest side to gt_size first
+                if min(h, w) < gt_size:
+                    if not hasattr(self, 'smallest_resizer_train'):
+                        self.smallest_resizer_train = util_image.SmallestMaxSize(
+                            max_size=gt_size, pass_resize=False,
+                        )
+                    img_gt = self.smallest_resizer_train(img_gt)
+                img_gt = random_crop(img_gt, gt_size)
         else:
             raise ValueError(f'Unexpected value {self.mode} for mode parameter')
 

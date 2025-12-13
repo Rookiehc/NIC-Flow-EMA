@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchvision.utils as vutils
 from torch.nn.parallel import DistributedDataParallel as DDP
+from contextlib import nullcontext
 
 from utils import util_net
 from utils import util_common
@@ -31,12 +32,23 @@ from utils.util_ops import append_dims
 import pyiqa
 from basicsr.utils import DiffJPEG, USMSharp
 from basicsr.utils.img_process_util import filter2D
+from basicsr.data.degradations import circular_lowpass_kernel, random_mixed_kernels
 from basicsr.data.transforms import paired_random_crop
 from basicsr.data.degradations import random_add_gaussian_noise_pt, random_add_poisson_noise_pt
 
 from diffusers import EulerDiscreteScheduler
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import retrieve_timesteps
+
+# Optional dependencies used in certain configurations
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None
 
 _base_seed = 10**6
 _INTERPOLATION_MODE = 'bicubic'
@@ -58,20 +70,37 @@ class TrainerBase:
 
     def setup_dist(self):
         num_gpus = torch.cuda.device_count()
+        # Make distributed setup robust: only initialize process group when
+        # launcher-provided environment variables exist (LOCAL_RANK / WORLD_SIZE),
+        # otherwise fall back to single-process mode.
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        local_rank_present = 'LOCAL_RANK' in os.environ
 
-        if num_gpus > 1:
+        if num_gpus > 1 and (world_size > 1 or local_rank_present):
             if mp.get_start_method(allow_none=True) is None:
                 mp.set_start_method('spawn')
-            rank = int(os.environ['LOCAL_RANK'])
+            # prefer LOCAL_RANK but tolerate missing variable
+            try:
+                rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', 0)))
+            except Exception:
+                rank = 0
             torch.cuda.set_device(rank % num_gpus)
-            dist.init_process_group(
+            try:
+                dist.init_process_group(
                     timeout=datetime.timedelta(seconds=3600),
                     backend='nccl',
                     init_method='env://',
-                    )
+                )
+            except Exception as e:
+                # if init fails, gracefully fall back to single-process
+                print(f"Warning: distributed init failed: {e}; falling back to single-process mode")
+                rank = 0
+                world_size = 1
+        else:
+            rank = 0
 
         self.num_gpus = num_gpus
-        self.rank = int(os.environ['LOCAL_RANK']) if num_gpus > 1 else 0
+        self.rank = int(rank)
 
     def setup_seed(self, seed=None, global_seeding=None):
         if seed is None:
@@ -146,6 +175,10 @@ class TrainerBase:
         # logging the configurations
         if self.rank == 0:
             self.logger.info(OmegaConf.to_yaml(self.configs))
+        # initialize time markers for elapsed-time logging windows
+        # so downstream log_step_train can safely compute elapsed even on first window
+        self.tic = time.time()
+        self.toc = self.tic
 
     def close_logger(self):
         if self.rank == 0 and self.tf_logging:
@@ -270,7 +303,8 @@ class TrainerBase:
                 self.logger.info("Compile the model...")
             model.to(memory_format=torch.channels_last)
             model = torch.compile(model, mode="max-autotune", fullgraph=False)
-        if self.num_gpus > 1:
+        # Wrap with DDP only when torch.distributed is initialized
+        if (self.num_gpus > 1) and dist.is_available() and dist.is_initialized():
             model = DDP(model, device_ids=[self.rank,])  # wrap the network
         if self.rank == 0 and hasattr(self.configs.train, 'ema_rate'):
             self.ema_model = deepcopy(model)
@@ -288,7 +322,7 @@ class TrainerBase:
                     self.logger.info("Compile the discriminator...")
                 discriminator.to(memory_format=torch.channels_last)
                 discriminator = torch.compile(discriminator, mode="max-autotune", fullgraph=False)
-            if self.num_gpus > 1:
+            if (self.num_gpus > 1) and dist.is_available() and dist.is_initialized():
                 discriminator = DDP(discriminator, device_ids=[self.rank,])  # wrap the network
             if self.configs.train.loss_coef.get('ldis', 0) > 0:
                 if self.configs.discriminator.enable_grad_checkpoint:
@@ -379,6 +413,29 @@ class TrainerBase:
                 self.set_grad_checkpointing(sd_pipe.transformer)
         self.sd_pipe = sd_pipe
 
+        # Reduce memory: enable attention/vae slicing when available
+        try:
+            if hasattr(self.sd_pipe, 'enable_attention_slicing'):
+                self.sd_pipe.enable_attention_slicing("max")
+            if hasattr(self.sd_pipe, 'vae') and hasattr(self.sd_pipe.vae, 'enable_slicing'):
+                self.sd_pipe.vae.enable_slicing()
+            # optional: xFormers memory efficient attention if available
+            if hasattr(self.sd_pipe, 'enable_xformers_memory_efficient_attention'):
+                self.sd_pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+
+        # If multiple GPUs are visible but distributed is not initialized, optionally leverage DataParallel
+        # to utilize multiple GPUs for heavy SD UNet forward.
+        if (self.num_gpus > 1) and (not (dist.is_available() and dist.is_initialized())):
+            try:
+                self.sd_pipe.unet = torch.nn.DataParallel(self.sd_pipe.unet, device_ids=list(range(self.num_gpus)))
+                if self.rank == 0:
+                    self.logger.info("Wrapped sd_pipe.unet with DataParallel for multi-GPU utilization (no DDP).")
+            except Exception as e:
+                if self.rank == 0:
+                    self.logger.info(f"Skip DataParallel for sd_pipe.unet due to: {e}")
+
         # latent LPIPS loss
         if self.configs.train.loss_coef.get('llpips', 0) > 0:
             params = self.configs.llpips.get('params', dict)
@@ -425,7 +482,12 @@ class TrainerBase:
         # make datasets
         datasets = {'train': create_dataset(self.configs.data.get('train', dict)), }
         if hasattr(self.configs.data, 'val') and self.rank == 0:
-            datasets['val'] = create_dataset(self.configs.data.get('val', dict))
+            # Use full validation set regardless of a 'length' cap in config
+            cfg_val = deepcopy(self.configs.data.get('val', dict))
+            if isinstance(cfg_val, dict) and 'params' in cfg_val and isinstance(cfg_val['params'], dict):
+                # drop 'length' to avoid truncation
+                cfg_val['params'].pop('length', None)
+            datasets['val'] = create_dataset(cfg_val)
         if self.rank == 0:
             for phase in datasets.keys():
                 length = len(datasets[phase])
@@ -440,25 +502,95 @@ class TrainerBase:
                     )
         else:
             sampler = None
-        dataloaders = {'train': _wrap_loader(udata.DataLoader(
-                        datasets['train'],
-                        batch_size=self.configs.train.batch // self.num_gpus,
-                        shuffle=False if self.num_gpus > 1 else True,
-                        drop_last=True,
-                        num_workers=min(self.configs.train.num_workers, 4),
-                        pin_memory=True,
-                        prefetch_factor=self.configs.train.get('prefetch_factor', 2),
-                        worker_init_fn=my_worker_init_fn,
-                        sampler=sampler,
-                        ))}
+
+        # Use microbatch as actual loader batch to avoid staging a large batch on GPU before micro-splitting
+        effective_train_bs = max(1, int(self.configs.train.microbatch))
+        dataloaders = {
+            'train': _wrap_loader(udata.DataLoader(
+                datasets['train'],
+                batch_size=effective_train_bs,
+                shuffle=False if self.num_gpus > 1 else True,
+                drop_last=True,
+                num_workers=min(self.configs.train.num_workers, 4),
+                pin_memory=True,
+                prefetch_factor=self.configs.train.get('prefetch_factor', 2),
+                worker_init_fn=my_worker_init_fn,
+                sampler=sampler,
+            ))
+        }
         if hasattr(self.configs.data, 'val') and self.rank == 0:
-            dataloaders['val'] = udata.DataLoader(datasets['val'],
-                                                  batch_size=self.configs.validate.batch,
-                                                  shuffle=False,
-                                                  drop_last=False,
-                                                  num_workers=0,
-                                                  pin_memory=True,
-                                                 )
+            # Use a safe collate that中心裁剪到固定尺寸
+            # 关键点：GT 对齐到 gt_size；LQ 对齐到 (gt_size // sf)，避免把 LQ 错误地放大到 GT 尺寸，
+            # 造成噪声预测器输出尺寸与 VAE latent 不匹配（例如出现 256 vs 64）。
+            target_size = int(self.configs.degradation.get('gt_size', 256))
+            sf = self.configs.degradation.get('sf', 4)
+            try:
+                lr_size = int(target_size // sf) if isinstance(sf, int) else int(target_size // int(round(sf)))
+                lr_size = max(8, lr_size)
+            except Exception:
+                lr_size = max(8, target_size // 4)
+
+            def _resize_ccrop_tensor(img: torch.Tensor, size: int) -> torch.Tensor:
+                # img: C x H x W, size: int
+                if img.ndim != 3:
+                    return img
+                C, H, W = img.shape
+                # 如果最短边小于目标，按最短边等比放大到目标
+                if min(H, W) < size:
+                    scale = float(size) / float(min(H, W))
+                    new_h, new_w = int(round(H * scale)), int(round(W * scale))
+                    img = F.interpolate(img.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False).squeeze(0)
+                    H, W = new_h, new_w
+                # 中心裁剪到 size x size
+                top = max((H - size) // 2, 0)
+                left = max((W - size) // 2, 0)
+                img = img[:, top:top + size, left:left + size]
+                # 若仍然不满足精确 size（边界情况），进行必要的填充或截断
+                if img.shape[-2] != size or img.shape[-1] != size:
+                    pad_h = max(size - img.shape[-2], 0)
+                    pad_w = max(size - img.shape[-1], 0)
+                    if pad_h > 0 or pad_w > 0:
+                        img = F.pad(img, (0, pad_w, 0, pad_h))
+                    img = img[:, :size, :size]
+                return img
+
+            def _val_collate_fixed(batch):
+                out = {}
+                # 处理张量型字段：image / lq / gt（若存在）
+                for key in ['image', 'lq', 'gt']:
+                    if key in batch[0]:
+                        if key == 'lq':
+                            # 低清图对齐到 lr_size，保持与 VAE latent（gt_size/8）相容，
+                            # 同时噪声预测器（一次下采样）输出将为 (lr_size/2) = (gt_size/ (2*sf))，
+                            # 在 sf=4 时正好与 latent 64 对齐（512->64）。
+                            imgs = [ _resize_ccrop_tensor(sample[key], lr_size) for sample in batch ]
+                        else:
+                            imgs = [ _resize_ccrop_tensor(sample[key], target_size) for sample in batch ]
+                        out[key] = torch.stack(imgs, dim=0)
+                # 透传非张量字段
+                for key in batch[0].keys():
+                    if key in ['image', 'lq', 'gt']:
+                        continue
+                    vals = [ sample[key] for sample in batch ]
+                    # 对于可直接 stack 的张量也尝试 stack，否则保留列表
+                    if isinstance(vals[0], torch.Tensor):
+                        try:
+                            out[key] = torch.stack(vals, dim=0)
+                        except Exception:
+                            out[key] = vals
+                    else:
+                        out[key] = vals
+                return out
+
+            dataloaders['val'] = udata.DataLoader(
+                datasets['val'],
+                batch_size=self.configs.validate.batch,
+                shuffle=False,
+                drop_last=False,
+                num_workers=0,
+                pin_memory=True,
+                collate_fn=_val_collate_fixed,
+            )
 
         self.datasets = datasets
         self.dataloaders = dataloaders
@@ -650,6 +782,68 @@ class TrainerBase:
                 source_value.sub_(one_minus_decay * (source_value - target_value.data))
 
 class TrainerBaseSR(TrainerBase):
+    def _generate_realesrgan_kernels(self):
+        """Generate (kernel1, kernel2, sinc_kernel) following RealESRGAN's rules using
+        dataset params in configs.data.train.params.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: kernel1, kernel2, sinc_kernel
+        """
+        opt = self.configs.data.train.params
+
+        # kernel 1
+        kernel_range1 = [x for x in range(3, int(opt.blur_kernel_size), 2)]
+        ksize1 = random.choice(kernel_range1)
+        if np.random.uniform() < float(opt.sinc_prob):
+            omega_c = np.random.uniform(np.pi / 3, np.pi) if ksize1 < 13 else np.random.uniform(np.pi / 5, np.pi)
+            k1 = circular_lowpass_kernel(omega_c, ksize1, pad_to=False)
+        else:
+            k1 = random_mixed_kernels(
+                list(opt.kernel_list),
+                list(opt.kernel_prob),
+                ksize1,
+                list(opt.blur_sigma),
+                list(opt.blur_sigma),
+                [-math.pi, math.pi],
+                list(opt.betag_range),
+                list(opt.betap_range),
+                noise_range=None,
+            )
+        pad = (int(opt.blur_kernel_size) - ksize1) // 2
+        k1 = np.pad(k1, ((pad, pad), (pad, pad)))
+
+        # kernel 2
+        kernel_range2 = [x for x in range(3, int(opt.blur_kernel_size2), 2)]
+        ksize2 = random.choice(kernel_range2)
+        if np.random.uniform() < float(opt.sinc_prob2):
+            omega_c = np.random.uniform(np.pi / 3, np.pi) if ksize2 < 13 else np.random.uniform(np.pi / 5, np.pi)
+            k2 = circular_lowpass_kernel(omega_c, ksize2, pad_to=False)
+        else:
+            k2 = random_mixed_kernels(
+                list(opt.kernel_list2),
+                list(opt.kernel_prob2),
+                ksize2,
+                list(opt.blur_sigma2),
+                list(opt.blur_sigma2),
+                [-math.pi, math.pi],
+                list(opt.betag_range2),
+                list(opt.betap_range2),
+                noise_range=None,
+            )
+        pad2 = (int(opt.blur_kernel_size2) - ksize2) // 2
+        k2 = np.pad(k2, ((pad2, pad2), (pad2, pad2)))
+
+        # final sinc kernel or pulse
+        if np.random.uniform() < float(opt.final_sinc_prob):
+            ksize_f = random.choice(kernel_range2)
+            omega_c = np.random.uniform(np.pi / 3, np.pi)
+            sinc_k = circular_lowpass_kernel(omega_c, ksize_f, pad_to=int(opt.blur_kernel_size2))
+            sinc_k = torch.FloatTensor(sinc_k)
+        else:
+            sinc_k = torch.zeros(int(opt.blur_kernel_size2), int(opt.blur_kernel_size2)).float()
+            sinc_k[int(opt.blur_kernel_size2)//2, int(opt.blur_kernel_size2)//2] = 1
+
+        return torch.FloatTensor(k1), torch.FloatTensor(k2), sinc_k
     @torch.no_grad()
     def _dequeue_and_enqueue(self):
         """It is the training pair pool for increasing the diversity in a batch.
@@ -872,6 +1066,113 @@ class TrainerBaseSR(TrainerBase):
             batch['lq'] = data['lq'].cuda()
             if 'gt' in data:
                 batch['gt'] = data['gt'].cuda()
+            else:
+                # Fallback: use input lq as gt, and generate a further degraded lq using RealESRGAN-style pipeline
+                # Ensure JPEGer exists
+                if not hasattr(self, 'jpeger'):
+                    self.jpeger = DiffJPEG(differentiable=False).cuda()
+
+                im_gt = batch['lq']
+                # if values look normalized to [-1, 1], map back to [0, 1]
+                if torch.min(im_gt) < 0.0 or torch.max(im_gt) > 1.0:
+                    im_gt = (im_gt * 0.5 + 0.5).clamp(0.0, 1.0)
+
+                kernel1, kernel2, sinc_kernel = self._generate_realesrgan_kernels()
+                kernel1 = kernel1.to(im_gt.device)
+                kernel2 = kernel2.to(im_gt.device)
+                sinc_kernel = sinc_kernel.to(im_gt.device)
+
+                ori_h, ori_w = im_gt.size()[2:4]
+                # scale factor from degradation config
+                sf = self.configs.degradation.sf if isinstance(self.configs.degradation.sf, int) else random.uniform(*self.configs.degradation.sf)
+
+                # First degradation process
+                out = filter2D(im_gt, kernel1)
+                updown_type = random.choices(['up', 'down', 'keep'], self.configs.degradation['resize_prob'])[0]
+                if updown_type == 'up':
+                    scale = random.uniform(1, self.configs.degradation['resize_range'][1])
+                elif updown_type == 'down':
+                    scale = random.uniform(self.configs.degradation['resize_range'][0], 1)
+                else:
+                    scale = 1
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                out = F.interpolate(out, scale_factor=scale, mode=mode)
+
+                gray_noise_prob = self.configs.degradation['gray_noise_prob']
+                if random.random() < self.configs.degradation['gaussian_noise_prob']:
+                    out = random_add_gaussian_noise_pt(
+                        out,
+                        sigma_range=self.configs.degradation['noise_range'],
+                        clip=True,
+                        rounds=False,
+                        gray_prob=gray_noise_prob,
+                    )
+                else:
+                    out = random_add_poisson_noise_pt(
+                        out,
+                        scale_range=self.configs.degradation['poisson_scale_range'],
+                        gray_prob=gray_noise_prob,
+                        clip=True,
+                        rounds=False,
+                    )
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.configs.degradation['jpeg_range'])
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
+
+                # Second degradation process
+                if random.random() < self.configs.degradation['second_order_prob']:
+                    if random.random() < self.configs.degradation['second_blur_prob']:
+                        out = filter2D(out, kernel2)
+                    updown_type = random.choices(['up', 'down', 'keep'], self.configs.degradation['resize_prob2'])[0]
+                    if updown_type == 'up':
+                        scale = random.uniform(1, self.configs.degradation['resize_range2'][1])
+                    elif updown_type == 'down':
+                        scale = random.uniform(self.configs.degradation['resize_range2'][0], 1)
+                    else:
+                        scale = 1
+                    mode = random.choice(['area', 'bilinear', 'bicubic'])
+                    out = F.interpolate(out, size=(int(ori_h / sf * scale), int(ori_w / sf * scale)), mode=mode)
+
+                    gray_noise_prob = self.configs.degradation['gray_noise_prob2']
+                    if random.random() < self.configs.degradation['gaussian_noise_prob2']:
+                        out = random_add_gaussian_noise_pt(
+                            out,
+                            sigma_range=self.configs.degradation['noise_range2'],
+                            clip=True,
+                            rounds=False,
+                            gray_prob=gray_noise_prob,
+                        )
+                    else:
+                        out = random_add_poisson_noise_pt(
+                            out,
+                            scale_range=self.configs.degradation['poisson_scale_range2'],
+                            gray_prob=gray_noise_prob,
+                            clip=True,
+                            rounds=False,
+                        )
+
+                # Final JPEG + sinc
+                if random.random() < 0.5:
+                    mode = random.choice(['area', 'bilinear', 'bicubic'])
+                    out = F.interpolate(out, size=(ori_h // sf, ori_w // sf), mode=mode)
+                    out = filter2D(out, sinc_kernel)
+                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.configs.degradation['jpeg_range2'])
+                    out = torch.clamp(out, 0, 1)
+                    out = self.jpeger(out, quality=jpeg_p)
+                else:
+                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.configs.degradation['jpeg_range2'])
+                    out = torch.clamp(out, 0, 1)
+                    out = self.jpeger(out, quality=jpeg_p)
+                    mode = random.choice(['area', 'bilinear', 'bicubic'])
+                    out = F.interpolate(out, size=(ori_h // sf, ori_w // sf), mode=mode)
+                    out = filter2D(out, sinc_kernel)
+
+                if self.configs.degradation.resize_back:
+                    out = F.interpolate(out, size=(ori_h, ori_w), mode=_INTERPOLATION_MODE)
+
+                im_lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
+                batch['gt'] = im_gt
+                batch['lq'] = im_lq.contiguous()
             batch['txt'] = [_positive, ] * data['lq'].shape[0]
         else:
             batch = {key:value.cuda().to(dtype=torch.float32) for key, value in data.items()}
@@ -947,6 +1248,27 @@ class TrainerBaseSR(TrainerBase):
             out = out.clamp(-1.0, 1.0)
         return out
 
+    @torch.amp.autocast('cuda')
+    def decode_first_stage_grad(self, z, clamp=True):
+        """
+        Gradient-enabled VAE decode for training losses.
+
+        Note: VAE parameters remain frozen (requires_grad=False), but autograd will
+        compute gradients w.r.t. the input z so loss can flow back to z0_pred and the SR model.
+        """
+        z = z / self.sd_pipe.vae.config.scaling_factor
+
+        trunk_size = 1
+        if trunk_size < z.shape[0]:
+            out = torch.cat(
+                [self.sd_pipe.vae.decode(xx).sample for xx in z.split(trunk_size, 0)], dim=0,
+            )
+        else:
+            out = self.sd_pipe.vae.decode(z).sample
+        if clamp:
+            out = out.clamp(-1.0, 1.0)
+        return out
+
     def get_loss_from_discrimnator(self, logits_fake):
         if not (isinstance(logits_fake, list) or isinstance(logits_fake, tuple)):
             g_loss = -torch.mean(logits_fake, dim=list(range(1, logits_fake.ndim)))
@@ -978,7 +1300,8 @@ class TrainerBaseSR(TrainerBase):
             if last_batch or self.num_gpus <= 1:
                 losses, z0_pred, zt_noisy, tt = self.backward_step(micro_data, num_grad_accumulate)
             else:
-                with self.model.no_sync():
+                no_sync_cm = getattr(self.model, 'no_sync', nullcontext)
+                with no_sync_cm():
                     losses, z0_pred, zt_noisy, tt = self.backward_step(micro_data, num_grad_accumulate)
             if self.configs.train.loss_coef.get('ldis', 0) > 0:
                 z0_pred_list.append(z0_pred.detach())
@@ -1135,8 +1458,17 @@ class TrainerBaseSR(TrainerBase):
                 xt_pred = self.decode_first_stage(zt_noisy.detach())
                 self.logging_image(xt_pred, tag='xt-noisy', phase=phase, add_global_step=False)
             if z0_pred is not None:
-                x0_pred = self.decode_first_stage(z0_pred.detach())
-                self.logging_image(x0_pred, tag='x0-pred', phase=phase, add_global_step=False)
+                if 'x0_pred_img' in micro_data:
+                    self.logging_image(micro_data['x0_pred_img'], tag='x0-pred', phase=phase, add_global_step=False)
+                elif getattr(self.configs.train, 'latent_hr_loss_enable', False):
+                    # decode less frequently for visualization when using latent-only HR loss
+                    interval_vis = int(getattr(self.configs.train, 'hr_loss_interval', 10) or 10)
+                    if self.current_iters % interval_vis == 0:
+                        x0_pred = self.decode_first_stage(z0_pred.detach())
+                        self.logging_image(x0_pred, tag='x0-pred', phase=phase, add_global_step=False)
+                else:
+                    x0_pred = self.decode_first_stage(z0_pred.detach())
+                    self.logging_image(x0_pred, tag='x0-pred', phase=phase, add_global_step=False)
             if z0_gt is not None:
                 x0_recon = self.decode_first_stage(z0_gt.detach())
                 self.logging_image(x0_recon, tag='x0-recons', phase=phase, add_global_step=False)
@@ -1150,6 +1482,9 @@ class TrainerBaseSR(TrainerBase):
             self.tic = time.time()
         if ((self.current_iters //  self.configs.train.dis_update_freq) %
             (self.configs.train.save_freq // self.configs.train.dis_update_freq) == 0):
+            # guard in case tic was not set due to schedule edge cases
+            if not hasattr(self, 'tic'):
+                self.tic = time.time()
             self.toc = time.time()
             elaplsed = (self.toc - self.tic)
             self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
@@ -1167,15 +1502,28 @@ class TrainerBaseSR(TrainerBase):
         else:
             start_noise_predictor = self.start_model
             intermediate_noise_predictor = self.ema_model if self.configs.validate.use_ema else self.model
-        num_iters_epoch = math.ceil(len(self.datasets[phase]) / self.configs.validate.batch)
-        mean_psnr = mean_lpips = 0
+        # guard empty dataset
+        ds_len = len(self.datasets[phase]) if phase in self.datasets else 0
+        if ds_len == 0:
+            self.logger.info("Validation: dataset is empty, skipping.")
+            if not (self.configs.validate.use_ema and hasattr(self.configs.train, 'ema_rate')):
+                self.model.train()
+            torch.cuda.empty_cache()
+            return
+
+        num_iters_epoch = math.ceil(ds_len / self.configs.validate.batch)
+        mean_psnr = 0.0
+        mean_lpips = 0.0
+        metric_count = 0
         for jj, data in enumerate(self.dataloaders[phase]):
             data = self.prepare_data(data, phase='val')
             with torch.amp.autocast('cuda'):
+                # if 'gt' is absent in val set, use lq's size as target to avoid KeyError
+                target_hw = tuple((data['gt'] if 'gt' in data else data['lq']).shape[-2:])
                 xt_progressive, x0_progressive = self.sample(
                     image_lq=data['lq'],
                     prompt=[_positive,]*data['lq'].shape[0],
-                    target_size=tuple(data['gt'].shape[-2:]),
+                    target_size=target_hw,
                     start_noise_predictor=start_noise_predictor,
                     intermediate_noise_predictor=intermediate_noise_predictor,
                 )
@@ -1183,6 +1531,7 @@ class TrainerBaseSR(TrainerBase):
             num_inference_steps = len(xt_progressive)
 
             if 'gt' in data:
+                metric_count += data['gt'].shape[0]
                 if not hasattr(self, 'psnr_metric'):
                     self.psnr_metric = pyiqa.create_metric(
                             'psnr',
@@ -1223,9 +1572,10 @@ class TrainerBaseSR(TrainerBase):
                 )
                 self.logging_image(data['lq'], tag='LQ', phase=phase, add_global_step=True)
 
-        if 'gt' in data:
-            mean_psnr /= len(self.datasets[phase])
-            mean_lpips /= len(self.datasets[phase])
+        # metrics aggregation if gt existed in any batch
+        if metric_count > 0:
+            mean_psnr /= metric_count
+            mean_lpips /= metric_count
             self.logger.info(f'Validation Metric: PSNR={mean_psnr:5.2f}, LPIPS={mean_lpips:6.4f}...')
             self.logging_metric(mean_psnr, tag='PSNR', phase=phase, add_global_step=False)
             self.logging_metric(mean_lpips, tag='LPIPS', phase=phase, add_global_step=True)
@@ -1237,79 +1587,263 @@ class TrainerBaseSR(TrainerBase):
         torch.cuda.empty_cache()
 
     def backward_step(self, micro_data, num_grad_accumulate):
-        loss_coef = self.configs.train.loss_coef
+        # Base coefficients from config
+        loss_coef_cfg = self.configs.train.loss_coef
+        loss_coef = dict(loss_coef_cfg)
+        # Apply loss coefficient schedule if present (e.g., ramp lhr and llpips by iteration)
+        sched_loss = getattr(self.configs.train, 'loss_coef_schedule', None)
+        if sched_loss:
+            for entry in sorted(sched_loss, key=lambda x: int(x['iter'])):
+                if self.current_iters >= int(entry['iter']):
+                    for k, v in entry.items():
+                        if k == 'iter':
+                            continue
+                        loss_coef[k] = v
+                else:
+                    break
+        # Dynamic latent HR schedule: precompute effective component weights if schedule exists
+        latent_sched = getattr(self.configs.train, 'latent_hr_schedule', None)
+        effective_dir_w = float(getattr(self.configs.train, 'latent_hr_direction_weight', 0.0))
+        effective_grad_w = float(getattr(self.configs.train, 'latent_hr_grad_weight', 0.0))
+        effective_freq_w = float(getattr(self.configs.train, 'latent_hr_freq_weight', 0.0))
+        if latent_sched and getattr(self.configs.train, 'latent_hr_loss_enable', False):
+            # find last schedule entry with iter <= current_iters
+            for entry in sorted(latent_sched, key=lambda x: int(x['iter'])):
+                if self.current_iters >= int(entry['iter']):
+                    effective_dir_w = float(entry.get('direction', effective_dir_w))
+                    effective_grad_w = float(entry.get('grad', effective_grad_w))
+                    effective_freq_w = float(entry.get('freq', effective_freq_w))
+                else:
+                    break
 
-        losses = {}
+        # support IMM-style one-step with optional repeat sampling
+        # config knobs:
+        # - train.imm_fixed_timestep: int (e.g., 250). If set, always use this timestep.
+        # - train.sample_repeat: int >=1. If >1, repeat sampling and average losses.
         z0_gt = micro_data['gt_latent']
-        tt = torch.tensor(
-            random.choices(self.configs.train.timesteps, k=z0_gt.shape[0]),
-            dtype=torch.int64,
-            device=f"cuda:{self.rank}",
-        ) - 1
+        device = torch.device(f"cuda:{self.rank}")
 
-        with torch.autocast(device_type="cuda", enabled=self.configs.train.use_amp):
-            model_pred = self.model(
-                micro_data['lq'], tt, sample_posterior=False, center_input_sample=True,
-            )
-            z0_pred, zt_noisy_pred, z0_lq = self.sd_forward_step(
-                prompt=micro_data['txt'],
-                latents_hq=micro_data['gt_latent'],
-                image_lq=micro_data['lq'],
-                image_hq=micro_data['gt'],
-                model_pred=model_pred,
-                timesteps=tt,
-            )
-            # diffusion loss
-            if loss_coef.get('ldif', 0) > 0:
-                if self.configs.train.loss_type == 'L2':
-                    ldif_loss = F.mse_loss(z0_pred, z0_gt, reduction='none')
-                elif self.configs.train.loss_type == 'L1':
-                    ldif_loss = F.l1_loss(z0_pred, z0_gt, reduction='none')
-                else:
-                    raise TypeError(f"Unsupported Loss type for Diffusion: {self.configs.train.loss_type}")
-                ldif_loss = torch.mean(ldif_loss, dim=list(range(1, z0_gt.ndim)))
-                losses['ldif'] = ldif_loss * loss_coef['ldif']
-            # Gaussian constraints
-            if loss_coef.get('kl', 0) > 0:
-                losses['kl'] = model_pred.kl() * loss_coef['kl']
-            if loss_coef.get('pkl', 0) > 0:
-                losses['pkl'] = model_pred.partial_kl() * loss_coef['pkl']
-            if loss_coef.get('rkl', 0) > 0:
-                other = Box(
-                    {'mean': z0_gt-z0_lq,
-                     'var':torch.ones_like(z0_gt),
-                     'logvar':torch.zeros_like(z0_gt)}
+        fixed_t = self.configs.train.get('imm_fixed_timestep', None)
+        if fixed_t is not None:
+            tt = torch.full((z0_gt.shape[0],), int(fixed_t) - 1, dtype=torch.int64, device=device)
+        else:
+            tt = torch.tensor(
+                random.choices(self.configs.train.timesteps, k=z0_gt.shape[0]),
+                dtype=torch.int64,
+                device=device,
+            ) - 1
+
+        sample_repeat = int(self.configs.train.get('sample_repeat', 1) or 1)
+        # accumulators
+        losses_sum: Dict[str, torch.Tensor] = {}
+        last_z0_pred = None
+        last_zt_noisy_pred = None
+
+        for rr in range(sample_repeat):
+            with torch.autocast(device_type="cuda", enabled=self.configs.train.use_amp):
+                # one-step denoising prediction at timestep tt
+                model_pred = self.model(
+                    micro_data['lq'], tt, sample_posterior=False, center_input_sample=True,
                 )
-                losses['rkl'] = model_pred.kl(other) * loss_coef['rkl']
-            # discriminator loss
-            if loss_coef.get('ldis', 0) > 0:
-                if self.current_iters > self.configs.train.dis_init_iterations:
-                    logits_fake = self.discriminator(
-                        torch.clamp(z0_pred, min=_Latent_bound['min'], max=_Latent_bound['max']),
-                        timestep=tt,
-                        encoder_hidden_states=self.prompt_embeds,
-                    )
-                    losses['ldis'] = self.get_loss_from_discrimnator(logits_fake) * loss_coef['ldis']
-                else:
-                    losses['ldis'] = torch.zeros((z0_gt.shape[0], ), dtype=torch.float32).cuda()
-            # perceptual loss
-            if loss_coef.get('llpips', 0) > 0:
-                losses['llpips'] = self.llpips_loss(z0_pred, z0_gt).view(-1) * loss_coef['llpips']
+                z0_pred, zt_noisy_pred, z0_lq = self.sd_forward_step(
+                    prompt=micro_data['txt'],
+                    latents_hq=micro_data['gt_latent'],
+                    image_lq=micro_data['lq'],
+                    image_hq=micro_data['gt'],
+                    model_pred=model_pred,
+                    timesteps=tt,
+                )
 
-            for key in ['ldif', 'kl', 'rkl', 'pkl', 'ldis', 'llpips']:
-                if loss_coef.get(key, 0) > 0:
-                    if not 'loss' in losses:
-                        losses['loss'] = losses[key]
+                # diffusion loss
+                current_losses: Dict[str, torch.Tensor] = {}
+                if loss_coef.get('ldif', 0) > 0:
+                    if self.configs.train.loss_type == 'L2':
+                        ldif_loss = F.mse_loss(z0_pred, z0_gt, reduction='none')
+                    elif self.configs.train.loss_type == 'L1':
+                        ldif_loss = F.l1_loss(z0_pred, z0_gt, reduction='none')
                     else:
-                        losses['loss'] = losses['loss'] + losses[key]
-            loss = losses['loss'].mean() / num_grad_accumulate
+                        raise TypeError(f"Unsupported Loss type for Diffusion: {self.configs.train.loss_type}")
+                    ldif_loss = torch.mean(ldif_loss, dim=list(range(1, z0_gt.ndim)))
+                    current_losses['ldif'] = ldif_loss * loss_coef['ldif']
+                # Latent-space composite HR loss (alternative to image decode). Skips image branch if enabled.
+                if (getattr(self.configs.train, 'latent_hr_loss_enable', False)
+                    and loss_coef.get('lhr', 0) > 0):
+                    diff = z0_pred - z0_gt
+                    loss_type_lat = getattr(self.configs.train, 'latent_hr_loss_type', 'charbonnier')
+                    eps_charb = float(getattr(self.configs.train, 'latent_hr_charb_eps', 1e-3))
+                    if loss_type_lat == 'charbonnier':
+                        base = torch.sqrt(diff * diff + eps_charb * eps_charb)
+                    elif loss_type_lat == 'L1':
+                        base = diff.abs()
+                    elif loss_type_lat == 'L2':
+                        base = diff * diff
+                    else:
+                        raise TypeError(f"Unsupported latent_hr_loss_type: {loss_type_lat}")
+                    base = base.mean(dim=list(range(1, base.ndim)))  # (B,)
+                    # multi-scale pooling
+                    ms_scales = getattr(self.configs.train, 'latent_hr_multiscales', [1,])
+                    ms_losses = []
+                    for s in ms_scales:
+                        s_int = int(s)
+                        if s_int <= 1:
+                            continue
+                        z0_pred_s = F.avg_pool2d(z0_pred, kernel_size=s_int, stride=s_int)
+                        z0_gt_s = F.avg_pool2d(z0_gt, kernel_size=s_int, stride=s_int)
+                        d_s = z0_pred_s - z0_gt_s
+                        if loss_type_lat == 'charbonnier':
+                            ls = torch.sqrt(d_s * d_s + eps_charb * eps_charb)
+                        elif loss_type_lat == 'L1':
+                            ls = d_s.abs()
+                        else:
+                            ls = d_s * d_s
+                        ms_losses.append(ls.mean(dim=list(range(1, ls.ndim))))
+                    ms_loss = torch.stack(ms_losses, dim=0).mean(dim=0) if len(ms_losses) > 0 else torch.zeros_like(base)
+                    # gradient consistency
+                    grad_w = effective_grad_w
+                    if grad_w > 0:
+                        dx = diff[:, :, :, 1:] - diff[:, :, :, :-1]
+                        dy = diff[:, :, 1:, :] - diff[:, :, :-1, :]
+                        grad_loss = dx.abs().mean(dim=list(range(1, dx.ndim))) + dy.abs().mean(dim=list(range(1, dy.ndim)))
+                    else:
+                        grad_loss = torch.zeros_like(base)
+                    # direction loss（带强度阈值）
+                    dir_w = effective_dir_w
+                    if dir_w > 0:
+                        v_pred = (z0_pred - z0_lq).view(z0_pred.shape[0], -1)
+                        v_gt = (z0_gt - z0_lq).view(z0_gt.shape[0], -1)
+                        v_pred_n = F.normalize(v_pred, dim=1)
+                        v_gt_n = F.normalize(v_gt, dim=1)
+                        cos_sim = (v_pred_n * v_gt_n).sum(dim=1)
+                        dir_loss = 1.0 - cos_sim
+                        # 阈值：当 |v_gt| 的平均绝对值低于阈值时，屏蔽该项
+                        min_norm = float(getattr(self.configs.train, 'latent_hr_dir_min_norm', 0.0))
+                        if min_norm > 0:
+                            v_gt_strength = v_gt.abs().mean(dim=1)
+                            mask = (v_gt_strength >= min_norm).float()
+                            dir_loss = dir_loss * mask
+                    else:
+                        dir_loss = torch.zeros_like(base)
+                    # Laplacian high-frequency loss
+                    freq_w = effective_freq_w
+                    if freq_w > 0:
+                        if not hasattr(self, '_lap_kernel'):
+                            k = torch.tensor([[0., 1., 0.],[1., -4., 1.],[0., 1., 0.]], device=z0_pred.device)
+                            k = k.view(1,1,3,3).repeat(z0_pred.shape[1],1,1,1)
+                            self._lap_kernel = k
+                        lap_pred = F.conv2d(z0_pred, self._lap_kernel, padding=1, groups=z0_pred.shape[1])
+                        lap_gt = F.conv2d(z0_gt, self._lap_kernel, padding=1, groups=z0_gt.shape[1])
+                        lap_diff = lap_pred - lap_gt
+                        freq_loss = lap_diff.abs().mean(dim=list(range(1, lap_diff.ndim)))
+                    else:
+                        freq_loss = torch.zeros_like(base)
+                    latent_total = base + ms_loss + grad_w * grad_loss + dir_w * dir_loss + freq_w * freq_loss
+                    current_losses['lhr'] = latent_total * loss_coef['lhr']
+                    # push component stats for logging only（不参与反向）
+                    if getattr(self.configs.train, 'latent_hr_log_components', False):
+                        current_losses['lhr_base'] = base.detach()
+                        current_losses['lhr_ms'] = ms_loss.detach()
+                        current_losses['lhr_grad'] = grad_loss.detach()
+                        current_losses['lhr_dir'] = dir_loss.detach()
+                        current_losses['lhr_freq'] = freq_loss.detach()
+                    if getattr(self.configs.train, 'latent_hr_log_components', False):
+                        micro_data['latent_hr_components'] = {
+                            'base': base.detach(),
+                            'ms': ms_loss.detach(),
+                            'grad': grad_loss.detach(),
+                            'dir': dir_loss.detach(),
+                            'freq': freq_loss.detach(),
+                        }
+                # Scheduled HR image-space loss (optional); compute only at configured interval
+                if loss_coef.get('lhr', 0) > 0 and getattr(self.configs.train, 'extra_hr_loss_enable', False):
+                    interval = int(getattr(self.configs.train, 'hr_loss_interval', 1) or 1)
+                    start_it = int(getattr(self.configs.train, 'hr_loss_start', 0) or 0)
+                    stop_it = getattr(self.configs.train, 'hr_loss_stop', None)
+                    do_hr = (self.current_iters >= start_it) and (self.current_iters % interval == 0)
+                    if (stop_it is not None) and isinstance(stop_it, int):
+                        do_hr = do_hr and (self.current_iters <= stop_it)
+                    if do_hr:
+                        # gradient-enabled decode (VAE params frozen); keep activation only for loss
+                        x0_img = self.decode_first_stage_grad(z0_pred, clamp=True)
+                        # reuse decoded image in logging (already detached so graph freed for logging use)
+                        if getattr(self.configs.train, 'reuse_decoded_for_logging', True):
+                            micro_data['x0_pred_img'] = x0_img.detach()
+                        # convert to [0,1] for pixel-space regression
+                        x0_img_loss = util_image.normalize_th(x0_img, mean=0.5, std=0.5, reverse=True)
+                        gt_img = micro_data['gt']
+                        if self.configs.train.extra_hr_loss_type == 'L2':
+                            hr_loss = F.mse_loss(x0_img_loss, gt_img, reduction='none')
+                        else:
+                            hr_loss = F.l1_loss(x0_img_loss, gt_img, reduction='none')
+                        hr_loss = hr_loss.view(hr_loss.shape[0], -1).mean(dim=1)  # (B,)
+                        current_losses['lhr'] = hr_loss * loss_coef['lhr']
+                        # release activations promptly
+                        del x0_img_loss, hr_loss
+                        if not getattr(self.configs.train, 'reuse_decoded_for_logging', True):
+                            del x0_img
+                        if getattr(self.configs.train, 'hr_loss_empty_cache', False):
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                # Gaussian constraints
+                if loss_coef.get('kl', 0) > 0:
+                    current_losses['kl'] = model_pred.kl() * loss_coef['kl']
+                if loss_coef.get('pkl', 0) > 0:
+                    current_losses['pkl'] = model_pred.partial_kl() * loss_coef['pkl']
+                if loss_coef.get('rkl', 0) > 0:
+                    other = Box(
+                        {'mean': z0_gt - z0_lq,
+                         'var': torch.ones_like(z0_gt),
+                         'logvar': torch.zeros_like(z0_gt)}
+                    )
+                    current_losses['rkl'] = model_pred.kl(other) * loss_coef['rkl']
+                # discriminator loss
+                if loss_coef.get('ldis', 0) > 0:
+                    if self.current_iters > self.configs.train.dis_init_iterations:
+                        logits_fake = self.discriminator(
+                            torch.clamp(z0_pred, min=_Latent_bound['min'], max=_Latent_bound['max']),
+                            timestep=tt,
+                            encoder_hidden_states=self.prompt_embeds,
+                        )
+                        current_losses['ldis'] = self.get_loss_from_discrimnator(logits_fake) * loss_coef['ldis']
+                    else:
+                        current_losses['ldis'] = torch.zeros((z0_gt.shape[0],), dtype=torch.float32, device=device)
+                # perceptual loss
+                if loss_coef.get('llpips', 0) > 0:
+                    current_losses['llpips'] = self.llpips_loss(z0_pred, z0_gt).view(-1) * loss_coef['llpips']
+
+                # aggregate sums for averaging later (keep graph for backward)
+                for key, val in current_losses.items():
+                    if key not in losses_sum:
+                        losses_sum[key] = val
+                    else:
+                        losses_sum[key] = losses_sum[key] + val
+
+                # keep last predictions for logging/visualization
+                last_z0_pred = z0_pred
+                last_zt_noisy_pred = zt_noisy_pred
+
+        # finalize averaged losses and total loss
+        losses: Dict[str, torch.Tensor] = {}
+        for key, val in losses_sum.items():
+            losses[key] = val / float(sample_repeat)
+
+        for key in ['ldif', 'lhr', 'kl', 'rkl', 'pkl', 'ldis', 'llpips']:
+            if loss_coef.get(key, 0) > 0 and key in losses:
+                if 'loss' not in losses:
+                    losses['loss'] = losses[key]
+                else:
+                    losses['loss'] = losses['loss'] + losses[key]
+
+        # gradient normalization over gradient accumulation and sample repeats
+        loss = losses['loss'].mean() / (num_grad_accumulate * float(sample_repeat))
 
         if self.amp_scaler is None:
             loss.backward()
         else:
             self.amp_scaler.scale(loss).backward()
 
-        return losses, z0_pred, zt_noisy_pred, tt
+        return losses, last_z0_pred, last_zt_noisy_pred, tt
 
     def dis_backward_step(self, target, inputs, tt, prompt_embeds):
         with torch.autocast(device_type="cuda", enabled=self.configs.train.use_amp):
@@ -1393,7 +1927,38 @@ class TrainerBaseSR(TrainerBase):
                 mean, std = model_pred.mean, model_pred.std
                 zt_noisy = latents + mean + sigmas * std * torch.randn_like(latents)
             else:
-                zt_noisy = latents + sigmas * model_pred.sample()
+                # get predicted sample from the noise predictor
+                sample = model_pred.sample()
+
+                # If spatial sizes don't match, try to interpolate the sample to latents' HxW
+                if sample.shape != latents.shape:
+                    # prefer to use class logger if available
+                    logger = getattr(self, 'logger', None)
+                    try:
+                        b_lat, c_lat = latents.shape[0], latents.shape[1]
+                        b_s, c_s = sample.shape[0], sample.shape[1]
+                    except Exception:
+                        b_lat = c_lat = b_s = c_s = None
+
+                    if b_s == b_lat and c_s == c_lat and sample.ndim == latents.ndim:
+                        target_h, target_w = latents.shape[-2], latents.shape[-1]
+                        # warn only once per Trainer instance to avoid log spam
+                        if not getattr(self, '_warned_sample_interp', False):
+                            if logger is not None:
+                                logger.warning(f"model_pred.sample() spatial size {sample.shape[-2:]} != latents {(target_h, target_w)}; interpolating predicted sample to match latents.")
+                            else:
+                                print(f"WARNING: model_pred.sample() spatial size {sample.shape[-2:]} != latents {(target_h, target_w)}; interpolating predicted sample to match latents.")
+                            self._warned_sample_interp = True
+
+                        # interpolate along spatial dims
+                        sample = F.interpolate(sample, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                    else:
+                        # incompatible shapes (batch/channel mismatch) — raise informative error
+                        raise RuntimeError(
+                            f"model_pred.sample() shape {tuple(sample.shape)} is incompatible with latents shape {tuple(latents.shape)}."
+                        )
+
+                zt_noisy = latents + sigmas * sample
 
         return zt_noisy
 
@@ -1493,15 +2058,32 @@ class TrainerSDTurboSR(TrainerBaseSR):
         prompt_embeds = prompt_embeds.to(device)
 
         zt_noisy_scale = self.scale_sd_input(zt_noisy, sigmas)
-        eps_pred = self.sd_pipe.unet(
-            zt_noisy_scale,
-            timesteps,
-            encoder_hidden_states=prompt_embeds,
-            timestep_cond=None,
-            cross_attention_kwargs=None,
-            added_cond_kwargs=None,
-            return_dict=False,
-        )[0]   # eps-mode for sdxl and sdxl-refiner
+        # Chunked UNet forward to reduce peak memory
+        sd_mb = int(self.configs.train.get('sd_microbatch', 0) or 0)
+        if sd_mb > 0 and zt_noisy_scale.shape[0] > sd_mb:
+            eps_list = []
+            for ss in range(0, zt_noisy_scale.shape[0], sd_mb):
+                eps_part = self.sd_pipe.unet(
+                    zt_noisy_scale[ss:ss+sd_mb],
+                    timesteps[ss:ss+sd_mb],
+                    encoder_hidden_states=prompt_embeds[ss:ss+sd_mb],
+                    timestep_cond=None,
+                    cross_attention_kwargs=None,
+                    added_cond_kwargs=None,
+                    return_dict=False,
+                )[0]
+                eps_list.append(eps_part)
+            eps_pred = torch.cat(eps_list, dim=0)
+        else:
+            eps_pred = self.sd_pipe.unet(
+                zt_noisy_scale,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                timestep_cond=None,
+                cross_attention_kwargs=None,
+                added_cond_kwargs=None,
+                return_dict=False,
+            )[0]   # eps-mode for sdxl and sdxl-refiner
 
         if self.configs.train.noise_detach:
             z0_pred = zt_noisy.detach() - sigmas * eps_pred

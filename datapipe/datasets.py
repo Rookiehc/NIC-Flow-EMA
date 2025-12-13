@@ -70,7 +70,7 @@ def get_transforms(transform_type, kwargs):
             thv.transforms.Normalize(mean=kwargs.get('mean', 0.5), std=kwargs.get('std', 0.5)),
         ])
     else:
-        raise ValueError(f'Unexpected transform_variant {transform_variant}')
+        raise ValueError(f'Unexpected transform_type {transform_type}')
     return transform
 
 def create_dataset(dataset_config):
@@ -105,13 +105,29 @@ class BaseData(Dataset):
         file_paths_all = []
         if dir_path is not None:
             file_paths_all.extend(util_common.scan_files_from_folder(dir_path, im_exts, recursive))
+            # fallback: if nothing found, try a broader extension set recursively
+            if len(file_paths_all) == 0:
+                fallback_exts = ['JPEG', 'JPG', 'jpeg', 'jpg', 'png', 'bmp']
+                file_paths_all.extend(util_common.scan_files_from_folder(dir_path, fallback_exts, True))
         if txt_path is not None:
             file_paths_all.extend(util_common.readline_txt(txt_path))
 
-        self.file_paths = file_paths_all if length is None else random.sample(file_paths_all, length)
+        # Robust length handling: clip requested length to available file count
+        if length is None:
+            self.file_paths = file_paths_all
+            self.length = len(file_paths_all)
+        else:
+            try:
+                req_len = int(length)
+            except Exception:
+                req_len = len(file_paths_all)
+            req_len = max(0, min(req_len, len(file_paths_all)))
+            if req_len == len(file_paths_all):
+                self.file_paths = file_paths_all
+            else:
+                self.file_paths = random.sample(file_paths_all, req_len)
+            self.length = req_len
         self.file_paths_all = file_paths_all
-
-        self.length = length
         self.need_path = need_path
         self.transform = get_transforms(transform_type, transform_kwargs)
 
@@ -119,21 +135,63 @@ class BaseData(Dataset):
         if extra_dir_path is not None:
             assert extra_transform_type is not None
             self.extra_transform = get_transforms(extra_transform_type, extra_transform_kwargs)
+            # build a filename -> fullpath map for extra_dir to support images stored in nested subfolders
+            try:
+                extra_files = util_common.scan_files_from_folder(extra_dir_path, im_exts, True)
+                if len(extra_files) == 0:
+                    fallback_exts = ['JPEG', 'JPG', 'jpeg', 'jpg', 'png', 'bmp']
+                    extra_files = util_common.scan_files_from_folder(extra_dir_path, fallback_exts, True)
+                # map by basename; if duplicates exist, first one wins
+                self.extra_map = { Path(p).name: p for p in extra_files }
+            except Exception:
+                self.extra_map = {}
 
     def __len__(self):
         return len(self.file_paths)
 
     def __getitem__(self, index):
-        im_path_base = self.file_paths[index]
-        im_base = util_image.imread(im_path_base, chn='rgb', dtype='float32')
+        # Try reading base image; if it fails, retry a few times with different indices to avoid crashing
+        tries = 0
+        max_retries = 5
+        im_base = None
+        im_path_base = None
+        while tries < max_retries:
+            im_path_base = self.file_paths[index]
+            try:
+                im_base = util_image.imread(im_path_base, chn='rgb', dtype='float32')
+                break
+            except Exception as e:
+                # randomly choose another index to try
+                tries += 1
+                index = random.randint(0, len(self.file_paths) - 1) if len(self.file_paths) > 1 else index
+                if tries >= max_retries:
+                    # re-raise after exhausting retries
+                    raise e
 
         im_target = self.transform(im_base)
-        out = {'image':im_target, 'lq':im_target}
+        out = {'image': im_target, 'lq': im_target}
 
         if self.extra_dir_path is not None:
-            im_path_extra = Path(self.extra_dir_path) / Path(im_path_base).name
-            im_extra = util_image.imread(im_path_extra, chn='rgb', dtype='float32')
-            im_extra = self.extra_transform(im_extra)
+            # Prefer lookup in the prebuilt map (handles nested folders). Fall back to direct path.
+            fname = Path(im_path_base).name
+            im_path_extra = None
+            if hasattr(self, 'extra_map') and fname in self.extra_map:
+                im_path_extra = self.extra_map[fname]
+            else:
+                candidate = Path(self.extra_dir_path) / fname
+                if candidate.exists():
+                    im_path_extra = str(candidate)
+
+            if im_path_extra is None:
+                # missing: use base image as proxy (preserve batch keys)
+                im_extra_np = im_base
+            else:
+                try:
+                    im_extra_np = util_image.imread(im_path_extra, chn='rgb', dtype='float32')
+                except Exception:
+                    im_extra_np = im_base
+
+            im_extra = self.extra_transform(im_extra_np)
             out['gt'] = im_extra
 
         if self.need_path:
@@ -142,7 +200,12 @@ class BaseData(Dataset):
         return out
 
     def reset_dataset(self):
-        self.file_paths = random.sample(self.file_paths_all, self.length)
+        # re-sample without exceeding population
+        k = max(0, min(self.length, len(self.file_paths_all)))
+        if k == len(self.file_paths_all):
+            self.file_paths = self.file_paths_all
+        else:
+            self.file_paths = random.sample(self.file_paths_all, k)
 
 class BaseDataMetaCond(Dataset):
     def __init__(

@@ -1,0 +1,285 @@
+# IMM training config for InvSR with SD-Turbo backbone
+
+trainer:
+  target: trainer_imm.TrainerIMM
+
+# Which base pipeline variant to use. Must be one of ['sd-turbo', 'sd2base']
+base_model: sd-turbo
+
+# Stable-diffusion / SD-Turbo pipeline configuration (mirrors sd-turbo-sr-ldis.yaml)
+sd_pipe:
+  target: diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline
+  num_train_steps: 1000
+  enable_grad_checkpoint: True
+  compile: False
+  vae_split: 1
+  offload_vae_to_cpu: False
+  params:
+    pretrained_model_name_or_path: stabilityai/sd-turbo
+    cache_dir: weights
+    use_safetensors: True
+    torch_dtype: torch.float16
+
+# Optional improved VAE in fp16 (following original config style)
+vae_fp16:
+  target: diffusers.models.autoencoders.AutoencoderKL
+  params:
+    pretrained_model_name_or_path: weights/vae_fp16
+    torch_dtype: torch.float16
+
+# Scheduler block (can be replaced or extended)
+# scheduler:
+#   target: some_scheduler.Class
+#   params: {}
+
+llpips:
+  target: latent_lpips.lpips.LPIPS
+  ckpt_path: weights/vgg16_sdturbo_lpips.pth
+  compile: False
+  params:
+    pretrained: False
+    net: vgg16
+    lpips: True
+    spatial: False
+    pnet_rand: False
+    pnet_tune: True
+    use_dropout: True
+    eval_mode: True
+    latent: True
+    in_chans: 4
+    verbose: True
+
+model:
+  target: diffusers.models.autoencoders.NoisePredictor
+  ckpt_start_path: ~
+  ckpt_path: ~
+  compile: False
+  params:
+    in_channels: 3
+    down_block_types:
+      - DownBlock2D
+      - AttnDownBlock2D
+    up_block_types:
+      - AttnUpBlock2D
+      - UpBlock2D
+    block_out_channels:
+      - 256
+      - 512
+    layers_per_block:
+      - 3
+      - 3
+    act_fn: silu
+    latent_channels: 4
+    norm_num_groups: 32
+    sample_size: 64
+    mid_block_add_attention: True
+    resnet_time_scale_shift: default
+    temb_channels: 512
+    attention_head_dim: 64
+    freq_shift: 0
+    flip_sin_to_cos: True
+    double_z: True
+
+discriminator:
+  target: diffusers.models.unets.unet_2d_condition_discriminator.UNet2DConditionDiscriminator
+  enable_grad_checkpoint: True
+  compile: False
+  params:
+    sample_size: 64
+    in_channels: 4
+    center_input_sample: False
+    flip_sin_to_cos: True
+    freq_shift: 0
+    down_block_types:
+      - DownBlock2D
+      - CrossAttnDownBlock2D
+      - CrossAttnDownBlock2D
+    mid_block_type: UNetMidBlock2DCrossAttn
+    up_block_types:
+      - CrossAttnUpBlock2D
+      - CrossAttnUpBlock2D
+      - UpBlock2D
+    only_cross_attention: False
+    block_out_channels:
+      - 64
+      - 128
+      - 256
+    layers_per_block:
+      - 1
+      - 1
+      - 1
+    downsample_padding: 1
+    mid_block_scale_factor: 1
+    dropout: 0.0
+    act_fn: silu
+    norm_num_groups: 32
+    norm_eps: 1e-5
+    cross_attention_dim: 1024
+
+degradation:
+  sf: 4
+  resize_prob: [0.2, 0.7, 0.1]
+  resize_range: [0.15, 1.5]
+  gaussian_noise_prob: 0.5
+  noise_range: [1, 30]
+  poisson_scale_range: [0.05, 3.0]
+  gray_noise_prob: 0.4
+  jpeg_range: [30, 95]
+  second_order_prob: 0.5
+  second_blur_prob: 0.8
+  resize_prob2: [0.3, 0.4, 0.3]
+  resize_range2: [0.3, 1.2]
+  gaussian_noise_prob2: 0.5
+  noise_range2: [1, 25]
+  poisson_scale_range2: [0.05, 2.5]
+  gray_noise_prob2: 0.4
+  jpeg_range2: [30, 95]
+  gt_size: 256
+  resize_back: False
+  use_sharp: False
+
+data:
+  train:
+    type: realesrgan
+    params:
+      data_source:
+        source1:
+          root_path: /data/yhc/imm_train_datasets
+          image_path: img512
+          moment_path: ~
+          text_path: ~
+          im_ext: JPEG
+          length: ~
+        source2:
+          root_path: /data/yhc/LSDIR
+          image_path: train_hr
+          moment_path: ~
+          text_path: ~
+          im_ext: png
+      # Enable recursive scanning to read images under nested subfolders like
+      # /data/yhc/LSDIR/train_hr/0046000/*.png
+      recursive: True
+      # RealESRGANDataset-required training options
+      use_hflip: True
+      use_rot: False
+      gt_size: 256
+      random_crop: False
+      max_token_length: 77
+      io_backend:
+        type: disk
+      blur_kernel_size: 21
+      kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+      kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+      sinc_prob: 0.1
+      blur_sigma: [0.2, 3.0]
+      betag_range: [0.5, 4.0]
+      betap_range: [1, 2.0]
+      blur_kernel_size2: 15
+      kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+      kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+      sinc_prob2: 0.1
+      blur_sigma2: [0.2, 1.5]
+      betag_range2: [0.5, 4.0]
+      betap_range2: [1, 2.0]
+      final_sinc_prob: 0.8
+  val:
+    type: base
+    params:
+      dir_path: /data/yhc/imm_val_datasets/img128
+      transform_type: default
+      transform_kwargs:
+          mean: 0.0
+          std: 1.0
+      extra_dir_path: /data/yhc/imm_val_datasets/img512
+      extra_transform_type: default
+      extra_transform_kwargs:
+          mean: 0.0
+          std: 1.0
+      im_exts: png
+      length: 32
+      recursive: True
+
+train:
+  start_mode: True
+  lr: 5e-5
+  lr_min: 5e-5
+  lr_schedule: ~
+  warmup_iterations: 2000
+  lr_dis: 5e-5
+  weight_decay_dis: 1e-3
+  dis_init_iterations: 10000    # iterations used for updating the discriminator
+  dis_update_freq: 2
+  batch: 2
+  microbatch: 1
+  sd_microbatch: 1
+  num_workers: 8
+  prefetch_factor: 4
+  use_text: True
+  weight_decay: 0
+  ema_rate: 0.999
+  iterations: 200000
+  save_freq: 5000
+  log_freq: [200, 5000]
+  local_logging: True
+  tf_logging: False
+  loss_type: L2
+  loss_coef:
+    ldif: 1.0
+    ldis: 0.1
+    llpips: 2.0
+    lhr: 0.05
+  timesteps: [250, 200, 150, 100]
+  num_inference_steps: 5
+  use_amp: True
+  use_fsdp: False
+  # Memory optimization flags
+  enable_unet_gradient_checkpointing: True
+  enable_attention_slicing: True
+  sliced_vae: True
+  tiled_vae: False
+  use_xformers: True
+  seed: 123456
+  global_seeding: False
+  noise_detach: False
+  extra_hr_loss_enable: False
+  extra_hr_loss_type: L1
+  hr_loss_interval: 10
+  hr_loss_start: 0
+  hr_loss_stop: ~
+  reuse_decoded_for_logging: True
+  hr_loss_empty_cache: False
+  latent_hr_loss_enable: True
+  latent_hr_loss_type: charbonnier
+  latent_hr_charb_eps: 2e-3
+  latent_hr_multiscales: [1, 2]
+  latent_hr_direction_weight: 0.2
+  latent_hr_grad_weight: 0.1
+  latent_hr_freq_weight: 0.05
+  latent_hr_log_components: True
+  latent_hr_dir_min_norm: 0.05
+  latent_hr_schedule:
+    - {iter: 0, direction: 0.0, grad: 0.0, freq: 0.0}
+    - {iter: 2000, direction: 0.2, grad: 0.05, freq: 0.02}
+    - {iter: 10000, direction: 0.25, grad: 0.08, freq: 0.04}
+  loss_coef_schedule:
+    - {iter: 2000, lhr: 0.10}
+    - {iter: 5000, llpips: 2.5}
+  imm_fixed_timestep: 250
+  sample_repeat: 1
+
+validate:
+  batch: 1
+  use_ema: True
+  log_freq: 4
+  val_y_channel: True
+
+loss:
+  # 与训练 batch 对齐：确保 batch 是 matrix_size 的整数倍
+  matrix_size: 2
+  sample_t_mode: lognormal
+  P_mean: -1.1
+  P_std: 2.0
+  label_dropout: 0.1
+  k: 12
+  a: 2
+  b: 4
