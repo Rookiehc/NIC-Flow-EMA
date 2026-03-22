@@ -306,6 +306,9 @@ class InvSamplerSR(BaseSampler):
             negative_prompt = [_negative,]*im_cond.shape[0]
         else:
             negative_prompt = None
+        
+        # Debug shape
+        # print(f"[Sampler] im_cond shape: {im_cond.shape}, dtype: {im_cond.dtype}")
 
         ori_h_lq, ori_w_lq = im_cond.shape[-2:]
         ori_w_hq = ori_w_lq * self.configs.basesr.sf
@@ -334,15 +337,40 @@ class InvSamplerSR(BaseSampler):
                 im_cond.shape[-2] * self.configs.basesr.sf,
                 im_cond.shape[-1] * self.configs.basesr.sf
             )
-            res_sr = self.sd_pipe(
-                image=im_cond.type(torch.float16),
-                prompt=[_positive, ]*im_cond.shape[0],
-                negative_prompt=negative_prompt,
-                target_size=target_size,
-                timesteps=self.configs.timesteps,
-                guidance_scale=self.configs.cfg_scale,
-                output_type="pt",    # torch tensor, b x c x h x w, [0, 1]
-            ).images
+            # Force FP16 for validation inference, temporarily
+            # NOTE: VAE in FP16 often causes "fried" artifacts / NaNs. Keep VAE in FP32.
+            dtype = torch.float16
+            restore_dtype = torch.float32  # Restore to Float32 for Trainer stability
+            
+            try:
+                # Cast to FP16
+                if hasattr(self.sd_pipe, 'unet'): self.sd_pipe.unet.to(dtype=dtype)
+                # if hasattr(self.sd_pipe, 'vae'): self.sd_pipe.vae.to(dtype=dtype)
+                if hasattr(self.sd_pipe, 'vae'): self.sd_pipe.vae.to(dtype=torch.float32)
+                if hasattr(self.sd_pipe, 'text_encoder') and self.sd_pipe.text_encoder is not None: self.sd_pipe.text_encoder.to(dtype=dtype)
+                snp = getattr(self.sd_pipe, 'start_noise_predictor', None)
+                if snp is not None: snp.to(dtype=dtype)
+
+                res_sr = self.sd_pipe(
+                    image=im_cond.to(self.sd_pipe.vae.dtype),
+                    prompt=[_positive, ]*im_cond.shape[0],
+                    negative_prompt=negative_prompt,
+                    target_size=target_size,
+                    timesteps=self.configs.timesteps,
+                    guidance_scale=self.configs.cfg_scale,
+                    output_type="pt",    # torch tensor, b x c x h x w, [0, 1]
+                ).images
+                
+                # Ensure output is float32 (CPU numpy conversion later expects it or handles it)
+                if isinstance(res_sr, torch.Tensor):
+                    res_sr = res_sr.to(torch.float32)
+            finally:
+                # Restore to Float32
+                if hasattr(self.sd_pipe, 'unet'): self.sd_pipe.unet.to(dtype=restore_dtype)
+                if hasattr(self.sd_pipe, 'vae'): self.sd_pipe.vae.to(dtype=restore_dtype)
+                if hasattr(self.sd_pipe, 'text_encoder') and self.sd_pipe.text_encoder is not None: self.sd_pipe.text_encoder.to(dtype=restore_dtype)
+                snp = getattr(self.sd_pipe, 'start_noise_predictor', None)
+                if snp is not None: snp.to(dtype=restore_dtype)
         else:
             if not (im_cond.shape[-2] % mod_lq == 0 and im_cond.shape[-1] % mod_lq == 0):
                 target_h_lq = math.ceil(im_cond.shape[-2] / mod_lq) * mod_lq
@@ -369,8 +397,15 @@ class InvSamplerSR(BaseSampler):
                 # end = torch.cuda.Event(enable_timing=True)
                 # start.record()
 
+                # Determine dtype from pipe components
+                dtype = torch.float16
+                if hasattr(self.sd_pipe, 'unet'):
+                    dtype = self.sd_pipe.unet.dtype
+                elif hasattr(self.sd_pipe, 'transformer'):
+                    dtype = self.sd_pipe.transformer.dtype
+
                 res_sr_pch = self.sd_pipe(
-                    image=im_lq_pch.type(torch.float16),
+                    image=im_lq_pch.to(dtype),
                     prompt=[_positive, ]*im_lq_pch.shape[0],
                     negative_prompt=negative_prompt,
                     target_size=target_size,

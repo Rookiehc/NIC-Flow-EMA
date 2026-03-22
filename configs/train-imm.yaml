@@ -6,6 +6,10 @@ trainer:
 # Which base pipeline variant to use. Must be one of ['sd-turbo', 'sd2base']
 base_model: sd-turbo
 
+# Memory optimizations
+use_xformers: True
+enable_attention_slicing: True
+
 # Stable-diffusion / SD-Turbo pipeline configuration (mirrors sd-turbo-sr-ldis.yaml)
 sd_pipe:
   target: diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline
@@ -15,7 +19,7 @@ sd_pipe:
   vae_split: 1
   offload_vae_to_cpu: False
   params:
-    pretrained_model_name_or_path: stabilityai/sd-turbo
+    pretrained_model_name_or_path: /home/yhc/code/InvSR_EMA/weights/models--stabilityai--sd-turbo/snapshots/b261bac6fd2cf515557d5d0707481eafa0485ec2
     cache_dir: weights
     use_safetensors: True
     torch_dtype: torch.float16
@@ -57,11 +61,11 @@ model:
   params:
     in_channels: 3
     down_block_types:
-      - DownBlock2D
+      - DownBlock2D  # AttnDownBlock2D / DownBlock2D
       - AttnDownBlock2D
     up_block_types:
       - AttnUpBlock2D
-      - UpBlock2D
+      - UpBlock2D   # AttnUpBlock2D / UpBlock2D
     block_out_channels:
       - 256
       - 512
@@ -134,7 +138,7 @@ degradation:
   poisson_scale_range2: [0.05, 2.5]
   gray_noise_prob2: 0.4
   jpeg_range2: [30, 95]
-  gt_size: 256
+  gt_size: 512
   resize_back: False
   use_sharp: False
 
@@ -148,21 +152,29 @@ data:
           image_path: img512
           moment_path: ~
           text_path: ~
-          im_ext: JPEG
-          length: ~
+          im_ext: png
+          length: 20000
         source2:
           root_path: /data/yhc/LSDIR
           image_path: train_hr
           moment_path: ~
           text_path: ~
           im_ext: png
+          length: ~
+        source3:
+          root_path: /data/yhc/FFHQ
+          image_path: 1024crop
+          moment_path: ~
+          text_path: ~
+          im_ext: png
+          length: 20000
       # Enable recursive scanning to read images under nested subfolders like
       # /data/yhc/LSDIR/train_hr/0046000/*.png
       recursive: True
       # RealESRGANDataset-required training options
       use_hflip: True
       use_rot: False
-      gt_size: 256
+      gt_size: 512
       random_crop: False
       max_token_length: 77
       io_backend:
@@ -196,22 +208,23 @@ data:
           mean: 0.0
           std: 1.0
       im_exts: png
-      length: 32
+      length: 320   # 需要拉大数据集，以避免数值的波动
       recursive: True
 
 train:
   start_mode: True
-  lr: 5e-5
-  lr_min: 5e-5
+  lr: 2e-5
+  lr_min: 1e-5
   lr_schedule: ~
   warmup_iterations: 2000
-  lr_dis: 5e-5
+  lr_dis: 1e-5           # [原 5e-5] 降低判别器学习率，防止D过强导致G梯度不稳定
   weight_decay_dis: 1e-3
-  dis_init_iterations: 10000    # iterations used for updating the discriminator
-  dis_update_freq: 2
-  batch: 2
-  microbatch: 1
-  sd_microbatch: 1
+  dis_init_iterations: 25000
+  dis_update_freq: 2     # [原 4] 稍微增加更新频次但降低学习率，使其更平滑（或者保持4，主要靠lr_dis控制）
+  batch: 8
+  microbatch: 2
+  force_fp32: False
+  val_max_batches: -1
   num_workers: 8
   prefetch_factor: 4
   use_text: True
@@ -219,21 +232,22 @@ train:
   ema_rate: 0.999
   iterations: 200000
   save_freq: 5000
+  val_freq: 0
   log_freq: [200, 5000]
   local_logging: True
   tf_logging: False
   loss_type: L2
   loss_coef:
     ldif: 1.0
-    ldis: 0.1
-    llpips: 2.0
-    lhr: 0.05
+    ldis: 0.03          # [再次强制修改] 之前日志显示为0.1，现强制设为0.01以降低Adv权重解决震荡
+    llpips: 1.5
+    lhr: 0.08
   timesteps: [250, 200, 150, 100]
   num_inference_steps: 5
   use_amp: True
   use_fsdp: False
   # Memory optimization flags
-  enable_unet_gradient_checkpointing: True
+  enable_unet_gradient_checkpointing: True   # 设置为true的话，可以节省显存
   enable_attention_slicing: True
   sliced_vae: True
   tiled_vae: False
@@ -257,18 +271,18 @@ train:
   latent_hr_freq_weight: 0.05
   latent_hr_log_components: True
   latent_hr_dir_min_norm: 0.05
-  latent_hr_schedule:
+  latent_hr_schedule:                          # Temporarily disabled for MMD/EMA-only experiments
     - {iter: 0, direction: 0.0, grad: 0.0, freq: 0.0}
-    - {iter: 2000, direction: 0.2, grad: 0.05, freq: 0.02}
-    - {iter: 10000, direction: 0.25, grad: 0.08, freq: 0.04}
-  loss_coef_schedule:
-    - {iter: 2000, lhr: 0.10}
-    - {iter: 5000, llpips: 2.5}
+    - {iter: 20000, direction: 0.2, grad: 0.05, freq: 0.02}
+    - {iter: 50000, direction: 0.25, grad: 0.08, freq: 0.04}
+  loss_coef_schedule:                          # Temporarily disabled (commented out)
+    - {iter: 20000, lhr: 0.10}
+    - {iter: 50000, llpips: 2.0}
   imm_fixed_timestep: 250
   sample_repeat: 1
 
 validate:
-  batch: 1
+  batch: 8
   use_ema: True
   log_freq: 4
   val_y_channel: True

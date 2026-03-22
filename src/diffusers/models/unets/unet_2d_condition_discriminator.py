@@ -1020,7 +1020,7 @@ class UNet2DConditionDiscriminator(
             # Kandinsky 2.1 - style
             if "image_embeds" not in added_cond_kwargs:
                 raise ValueError(
-                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'text_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'text_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_cond_kwargs`"
                 )
 
             image_embeds = added_cond_kwargs.get("image_embeds")
@@ -1029,14 +1029,14 @@ class UNet2DConditionDiscriminator(
             # Kandinsky 2.2 - style
             if "image_embeds" not in added_cond_kwargs:
                 raise ValueError(
-                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_cond_kwargs`"
                 )
             image_embeds = added_cond_kwargs.get("image_embeds")
             encoder_hidden_states = self.encoder_hid_proj(image_embeds)
         elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "ip_image_proj":
             if "image_embeds" not in added_cond_kwargs:
                 raise ValueError(
-                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_cond_kwargs`"
                 )
 
             if hasattr(self, "text_encoder_hid_proj") and self.text_encoder_hid_proj is not None:
@@ -1323,4 +1323,30 @@ class UNet2DConditionDiscriminator(
             unscale_lora_layers(self, lora_scale)
 
         return out
+
+    def enable_gradient_checkpointing(self):
+        """
+        Activates gradient checkpointing for the current model.
+
+        Note that in other frameworks this feature can be referred to as "activation checkpointing" or "checkpoint
+        activations".
+        """
+        self.gradient_checkpointing = True
+        def set_checkpointing(module):
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+        self.apply(set_checkpointing)
+
+    def disable_gradient_checkpointing(self):
+        """
+        Deactivates gradient checkpointing for the current model.
+
+        Note that in other frameworks this feature can be referred to as "activation checkpointing" or "checkpoint
+        activations".
+        """
+        self.gradient_checkpointing = False
+        def unset_checkpointing(module):
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = False
+        self.apply(unset_checkpointing)
 

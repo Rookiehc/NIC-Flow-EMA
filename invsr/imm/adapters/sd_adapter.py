@@ -72,41 +72,43 @@ class SDAdapter(nn.Module):
     @torch.no_grad()
     def _encode_to_latents(self, x: torch.Tensor) -> torch.Tensor:
         """Encode RGB images in [0,1] to latent space using VAE; pass latents through if already 4-ch."""
-        if x.dim() != 4:
-            raise ValueError(f"Expected BCHW tensor, got shape {tuple(x.shape)}")
-        if x.size(1) == 4:
+        # check if already latent
+        if x.shape[1] == 4:
             return x
-        assert self.vae is not None, "VAE is required to encode images to latents"
-        # Expect input in [0,1]; convert to [-1,1] for VAE encoder
-        x_ = (x * 2.0 - 1.0).to(self.vae.dtype)
-        # Prefer channels-last for slightly lower memory footprint during VAE forward
-        try:
-            x_ = x_.contiguous(memory_format=torch.channels_last)
-        except Exception:
-            pass
-        # Use mean of latent distribution to avoid extra sampling overhead
-        latents = self.vae.encode(x_).latent_dist.mean
-        latents = latents * self._get_vae_scaling()
-        return latents
+        
+        # encode
+        dtype = x.dtype
+        if self.vae:
+            self.vae.to(device=x.device) # ensure device
+            # vae expects [-1, 1] range if already normalized; but if we assume standard [0,1] or simple tensor?
+            # Standard diffusers pipeline expects inputs in [-1, 1].
+            # Assume caller normalizes.
+            
+            # Use deterministic encoding for teacher generation in IMM? Or sample?
+            # Typically sample() for variation, mode() for determinism.
+            # SD-Turbo is trained with standard VAE sampling.
+            
+            # Using autocast if available
+            with torch.cuda.amp.autocast(enabled=False):
+                # VAE is often strict on fp32
+                dist = self.vae.encode(x.float()).latent_dist
+                latents = dist.mode() # use mode for stability in distillation targets
+            
+            latents = latents * self.vae.config.scaling_factor
+            return latents.to(dtype)
+        else:
+            raise ValueError("VAE required for encoding images to latents")
 
     @torch.no_grad()
     def _decode_from_latents(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latents to RGB images in [0,1] using VAE; pass through if already 3-ch image.
         Returns BCHW float32 tensor in [0,1].
         """
-        if z.dim() != 4:
-            raise ValueError(f"Expected BCHW tensor, got shape {tuple(z.shape)}")
-        if z.size(1) == 3:
-            # assume already image in [0,1]
-            return z.to(torch.float32)
-        assert self.vae is not None, "VAE is required to decode latents to images"
-        # invert scaling
-        z_scaled = z / self._get_vae_scaling()
-        # decode to [-1,1]
-        x_rec = self.vae.decode(z_scaled).sample
-        # map back to [0,1]
-        x_img = (x_rec.clamp(-1, 1) + 1.0) / 2.0
-        return x_img.to(torch.float32)
+        z = z / self.vae.config.scaling_factor
+        with torch.cuda.amp.autocast(enabled=False):
+            image = self.vae.decode(z.float()).sample
+        image = torch.clamp(image, -1.0, 1.0) # Assume [-1,1] range
+        return image
 
     # --- sigma<->t mappings ---
     def nt_to_t(self, nt: torch.Tensor) -> torch.Tensor:
@@ -305,3 +307,54 @@ class SDAdapter(nn.Module):
         x0 = (x - sigma_t * eps) / (torch.sqrt(alpha_t) + 1e-8)
         x_next = torch.sqrt(alpha_n) * x0 + sigma_n * eps
         return x_next
+
+    def predict_x0(self, x_t: torch.Tensor, t: torch.Tensor, model_output: torch.Tensor) -> torch.Tensor:
+        """
+        Predict x0 from x_t and model output (assumed epsilon by default for SD-Turbo unless v-pred).
+        """
+        device = x_t.device
+        t_idx = t.to(torch.long).clamp(min=0, max=self.scheduler.config.num_train_timesteps-1)
+        alphas_cumprod = torch.tensor(self.scheduler.alphas_cumprod, device=device, dtype=model_output.dtype)
+        alpha_t = alphas_cumprod[t_idx].view(-1, 1, 1, 1)
+        sigma_t = torch.sqrt(1.0 - alpha_t)
+        
+        # SD-Turbo typically uses epsilon prediction. x0 = (x_t - sigma * eps) / sqrt(alpha)
+        # However, check scheduler config if using v-prediction.
+        # Assuming epsilon for now as standard SD backbone.
+        
+        pred_original_sample = (x_t - sigma_t * model_output) / torch.sqrt(alpha_t)
+        return pred_original_sample
+
+    @torch.no_grad()
+    def get_text_embeddings(self, prompts_list: list) -> torch.Tensor:
+        """Helper to encode text prompts to embeddings."""
+        dtype = getattr(self.unet, 'dtype', torch.float16)
+        if dtype != torch.float32:
+            dtype = torch.float32  # Prefer fp32 for text encoder outputs if checking stability, but match adapter logic
+            # Actually adapter.forward_features tries to match unet dtype or force fp32.
+            # Let's default to fp32 or unet dtype.
+            dtype = getattr(self.unet, 'dtype', torch.float16)
+
+        bs = len(prompts_list)
+        device = self.unet.device if hasattr(self.unet, 'device') else torch.device('cuda')
+
+        if self.tokenizer is None or self.text_encoder is None:
+             # Placeholder
+             expected_dim = getattr(getattr(self.unet, 'config', object()), 'cross_attention_dim', 1024)
+             seq_len = getattr(self.tokenizer, 'model_max_length', 77) if self.tokenizer is not None else 77
+             return torch.zeros((bs, seq_len, expected_dim), device=device, dtype=dtype)
+        
+        tokens = self.tokenizer(
+            prompts_list,
+            padding='max_length',
+            max_length=getattr(self.tokenizer, 'model_max_length', 77),
+            truncation=True,
+            return_tensors='pt',
+        )
+        tokens = {k: v.to(device) for k, v in tokens.items()}
+        te_out = self.text_encoder(**tokens)
+        if hasattr(te_out, 'last_hidden_state'):
+            out = te_out.last_hidden_state
+        else:
+            out = te_out[0]
+        return out.to(dtype)

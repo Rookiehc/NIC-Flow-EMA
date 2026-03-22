@@ -34,7 +34,7 @@ def get_parser(**parser_kwargs):
     parser.add_argument("-t", "--timesteps", type=int, nargs="+", help="The inversed timesteps")
     parser.add_argument("-n", "--num_steps", type=int, default=1, help="Number of inference steps")
     parser.add_argument(
-        "--cfg_path", type=str, default="./configs/sample-sd-turbo.yaml", help="Configuration path.",
+        "--cfg_path", type=str, default="./configs/infer-imm.yaml", help="Configuration path.",
     )
     parser.add_argument(
         "--sd_path", type=str, default="", help="Path for Stable Diffusion Model",
@@ -75,9 +75,9 @@ def get_configs(args):
         configs.timesteps = sorted(args.timesteps, reverse=True)
     else:
         if args.num_steps == 1:
-            configs.timesteps = [200,]
+            configs.timesteps = [250,]
         elif args.num_steps == 2:
-            configs.timesteps = [200, 100]
+            configs.timesteps = [250, 100]
         elif args.num_steps == 3:
             configs.timesteps = [200, 100, 50]
         elif args.num_steps == 4:
@@ -161,13 +161,20 @@ def main():
     configs = get_configs(args)
     sampler = InvSamplerSR(configs)
 
-    # 加载 IMM 训练生成的 UNet 与噪声预测器权重（trainer_imm 保存格式：{'unet': ..., 'noise_predictor': ...}）
+    # 加载 IMM 训练生成的 UNet 与噪声预测器权重
     if args.imm_ckpt_path:
         try:
             ckpt = torch.load(args.imm_ckpt_path, map_location="cpu")
-            state = ckpt.get('unet', ckpt)
+            # Prefer EMA weights if available
+            if 'unet_ema' in ckpt:
+                state = ckpt['unet_ema']
+                print(f"[INFO] Loaded IMM UNet weights (EMA) from {args.imm_ckpt_path}")
+            else:
+                state = ckpt.get('unet', ckpt)
+                print(f"[INFO] Loaded IMM UNet weights (Student/Online) from {args.imm_ckpt_path}")
+            
             sampler.unet.load_state_dict(state, strict=False)
-            print(f"[INFO] Loaded IMM UNet weights from {args.imm_ckpt_path}")
+            
             np_state = ckpt.get('noise_predictor', None)
             # model_start / noise_predictor 可能位于 sampler 或 sd_pipe 中
             noise_pred = None

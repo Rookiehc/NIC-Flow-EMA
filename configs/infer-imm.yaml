@@ -15,14 +15,14 @@ sd_pipe:
     pretrained_model_name_or_path: stabilityai/sd-turbo
     cache_dir: weights
     use_safetensors: True
-    torch_dtype: torch.float16
+    torch_dtype: torch.float32
 
-# Optional improved VAE (fp16). If you don't have this locally, you can remove this block.
+# Optional improved VAE (fp16 -> fp32). If you don't have this locally, you can remove this block.
 vae_fp16:
   target: diffusers.models.autoencoders.AutoencoderKL
   params:
     pretrained_model_name_or_path: weights/vae_fp16
-    torch_dtype: torch.float16
+    torch_dtype: torch.float32
 
 # Inference-time options (read by inference_invsr.py)
 bs: 1
@@ -49,7 +49,7 @@ basesr:
 
 # Default timesteps used when not provided via CLI. These are typical for sd-turbo-style inverse steps.
 # You can override via `--timesteps` or `--num_steps` in the command line.
-timesteps: [250, 200, 150, 100]
+timesteps: [250] # [250, 200, 150, 100]
 
 # Optional: reference stats for FID (can be overridden via CLI `--fid_ref`)
 fid_ref_stats: ~
@@ -57,15 +57,15 @@ fid_ref_stats: ~
 # Start Noise Predictor configuration (与训练配置保持一致)
 model_start:
   target: diffusers.models.autoencoders.NoisePredictor
-  ckpt_path: weights/noise_predictor_sd_turbo_v5.pth
+  ckpt_path: weights/ema_model_195000.pth
   params:
     in_channels: 3
     down_block_types:
-      - DownBlock2D
+      - DownBlock2D  # AttnDownBlock2D / DownBlock2D
       - AttnDownBlock2D
     up_block_types:
       - AttnUpBlock2D
-      - UpBlock2D
+      - UpBlock2D   # AttnUpBlock2D / UpBlock2D
     block_out_channels:
       - 256
       - 512

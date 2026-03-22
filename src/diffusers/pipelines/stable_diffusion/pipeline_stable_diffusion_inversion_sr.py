@@ -723,7 +723,10 @@ class StableDiffusionInvEnhancePipeline(
                 f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
             )
 
-        image = image.to(device=device, dtype=dtype)
+        # Force image to match VAE dtype if VAE is FP32
+        # Use VAE's dtype for encoding stability
+        vae_dtype = self.vae.dtype
+        image = image.to(device=device, dtype=vae_dtype)
 
         batch_size = batch_size * num_images_per_prompt
 
@@ -1132,6 +1135,8 @@ class StableDiffusionInvEnhancePipeline(
                         callback(step_idx, t, latents)
 
         if not output_type == "latent":
+            # Cast latents to VAE dtype to avoid mismatch if VAE is kept in FP32 while UNet is FP16
+            latents = latents.to(dtype=self.vae.dtype)
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
                 0
             ]

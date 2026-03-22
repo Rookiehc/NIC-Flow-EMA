@@ -81,7 +81,73 @@ class IMMLoss(nn.Module):
             cond["encoder_hidden_states"] = eh
         return cond
 
-    def forward(self, adapter_student, adapter_teacher, images, cond=None, device=None):
+    def compute_loss(self, f_st, f_sr, t, s, adapter, return_logs=False):
+        """
+        Computes IMM loss given features and time steps.
+        Args:
+            f_st: Student features at time s (from input t). Shape (B, M, ...) or (B, ...).
+            f_sr: Teacher features at time s (from input r). Shape (B, M, ...) or (B, ...).
+            t: Time steps t. sorted/arranged matching features. Shape (B,).
+            s: Time steps s. sorted/arranged matching features. Shape (B,).
+            adapter: The student adapter (for weight calculation).
+        """
+        # Ensure features are (B, M, ...)
+        if f_st.ndim == 4: # (B, C, H, W) -> (B, 1, C, H, W)
+            f_st = f_st.unsqueeze(1)
+        if f_sr.ndim == 4:
+            f_sr = f_sr.unsqueeze(1)
+        
+        # M is second dim
+        if f_st.shape[1] != self.matrix_size and self.matrix_size > 1:
+             # This happens if we manually pass non-matricized batches.
+             # We treat them as independent samples (matrix_size=1 effectively)
+             pass 
+
+        wt, wtout = adapter.get_kernel_weight(t, s, a=self.a, b=self.b)
+        
+        inter_sample = torch.nan_to_num(self.kernel(f_st, f_st, w=wt).mean((1, 2)), nan=0.0)
+        inter_gt = torch.nan_to_num(self.kernel(f_sr, f_sr, w=wt).mean((1, 2)), nan=0.0)
+        cross = torch.nan_to_num(self.kernel(f_st, f_sr, w=wt).mean((1, 2)), nan=0.0)
+        
+        loss_raw = torch.nan_to_num(inter_sample + inter_gt - 2 * cross, nan=0.0)
+        loss = loss_raw
+        if wtout is not None:
+            loss = wtout * loss
+        loss = torch.nan_to_num(loss, nan=0.0)
+        
+        if return_logs:
+            logs = {
+                "inter_sample_sim": inter_sample.detach().mean(),
+                "inter_gt_sim": inter_gt.detach().mean(),
+                "cross_sim": cross.detach().mean(),
+                "loss": loss.detach().mean(),
+                "wt_mean": wt.mean().detach(),
+                "wtout_mean": wtout.mean().detach() if wtout is not None else torch.tensor(float('nan'), device=wt.device),
+                "loss_raw": loss_raw.detach().mean(),
+            }
+            return loss.mean(), logs
+            
+        return loss.mean()
+
+    def forward(self, arg1, arg2, arg3=None, arg4=None, arg5=None, **kwargs):
+        """
+        Flexible forward that dispatches to compute_loss (if inputs are tensors) 
+        or _forward_pipeline (if inputs are adapters/images).
+        Arguments are generic to support both signatures:
+        1. compute_loss(f_st, f_sr, t, s, adapter, ...)
+        2. _forward_pipeline(adapter_student, adapter_teacher, images, cond, device, ...)
+        """
+        # Heuristic: if arg1 and arg2 are tensors, we are likely doing compute_loss
+        if isinstance(arg1, torch.Tensor) and isinstance(arg2, torch.Tensor):
+            return self.compute_loss(arg1, arg2, arg3, arg4, arg5, **kwargs)
+        
+        # Otherwise assume we are in pipeline mode
+        return self._forward_pipeline(arg1, arg2, arg3, arg4, arg5, **kwargs)
+
+    def _forward_pipeline(self, adapter_student, adapter_teacher, images, cond=None, device=None):
+        if images is None:
+             raise ValueError("IMMLoss pipeline forward called but 'images' is None.")
+        
         device = device or images.device
         # 保证每个 batch 的大小是 matrix_size 的整数倍，否则会导致时间步 t 的长度与图像 batch 不匹配
         batch_size = int(images.shape[0])
@@ -106,6 +172,9 @@ class IMMLoss(nn.Module):
         cond_drop = self._build_cond(cond or {}, drop_prob=self.label_dropout)
         # 使用与 UNet 相同的 dtype 以避免输入/权重 dtype 不匹配
         f_st = adapter_student.forward_features(y_t, t, s, cond=cond_drop, force_fp32=False, cond_drop=True)
+        
+        # Move teacher to GPU for forward pass
+        # Teacher is already on GPU
         with torch.no_grad():
             # Use teacher in its native dtype to avoid FP32/F16 dtype mismatch inside UNet time embedding
             f_sr = adapter_teacher.forward_features(y_r, r, s, cond=cond, force_fp32=False, cond_drop=False)
@@ -115,24 +184,4 @@ class IMMLoss(nn.Module):
         t_b = rearrange(t, "(b m) ... -> b m ...", m=self.matrix_size)[:, 0].flatten()
         s_b = rearrange(s, "(b m) ... -> b m ...", m=self.matrix_size)[:, 0].flatten()
 
-        wt, wtout = adapter_student.get_kernel_weight(t_b, s_b, a=self.a, b=self.b)
-        inter_sample = torch.nan_to_num(self.kernel(f_st, f_st, w=wt).mean((1, 2)), nan=0.0)
-        inter_gt = torch.nan_to_num(self.kernel(f_sr, f_sr, w=wt).mean((1, 2)), nan=0.0)
-        cross = torch.nan_to_num(self.kernel(f_st, f_sr, w=wt).mean((1, 2)), nan=0.0)
-        # MMD-like合成损失：当 inter_sample、inter_gt、cross 三者非常接近时，loss 会接近 0
-        loss_raw = torch.nan_to_num(inter_sample + inter_gt - 2 * cross, nan=0.0)
-        loss = loss_raw
-        if wtout is not None:
-            loss = wtout * loss
-        loss = torch.nan_to_num(loss, nan=0.0)
-        logs = {
-            "inter_sample_sim": inter_sample.detach(),
-            "inter_gt_sim": inter_gt.detach(),
-            "cross_sim": cross.detach(),
-            "loss": loss.detach(),
-            # 额外诊断：权重与原始项，便于定位为何loss接近0
-            "wt_mean": wt.mean().detach(),
-            "wtout_mean": wtout.mean().detach() if wtout is not None else torch.tensor(float('nan'), device=wt.device),
-            "loss_raw": loss_raw.detach(),
-        }
-        return loss.mean(), logs
+        return self.compute_loss(f_st, f_sr, t_b, s_b, adapter_student, return_logs=True)

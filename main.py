@@ -46,25 +46,25 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
             "--ldif",
             type=float,
-            default=1.0,
+            default=None,
             help="Loss coefficient for diffsuion in latent space",
             )
     parser.add_argument(
             "--llpips",
             type=float,
-            default=2.0,
+            default=None,
             help="Loss coefficient for latent lpips",
             )
     parser.add_argument(
             "--ldis",
             type=float,
-            default=0.1,
+            default=None,
             help="Loss coefficient for latent discriminator",
             )
     parser.add_argument(
             "--use_text",
             type=str2bool,
-            default='False',
+            default=None,
             help="Text Prompt",
             )
     parser.add_argument(
@@ -89,13 +89,14 @@ if __name__ == "__main__":
                 configs.train.loss_coef = OmegaConf.create({})
 
         # Apply CLI overrides safely
-        if args.ldif > 0:
+        if args.ldif is not None:
                 configs.train.loss_coef.ldif = args.ldif
-        if args.ldis > 0:
+        if args.ldis is not None:
                 configs.train.loss_coef.ldis = args.ldis
-        if args.llpips > 0:
+        if args.llpips is not None:
                 configs.train.loss_coef.llpips = args.llpips
-        configs.train.use_text = args.use_text
+        if args.use_text is not None:
+                configs.train.use_text = args.use_text
 
         # merge args to config
         for key in vars(args):
@@ -111,6 +112,21 @@ if __name__ == "__main__":
                                 configs.trainer.target = 'trainer_imm.TrainerIMM'
                 else:
                         configs.trainer = OmegaConf.create({'target': 'trainer_imm.TrainerIMM'})
+
+        # Increase NCCL/Distributed timeout for slow validation steps or initial compilation
+        import datetime
+        import torch.distributed as dist
+        
+        # We need to set timeout via init_process_group kwargs if it was called here.
+        # But 'trainer_imm' usually handles init inside __init__ using 'env://'.
+        # However, we can warn or try to set env vars before Trainer init if Pytorch supports it.
+        # Setting NCCL_TIMEOUT/GLOO_TIMEOUT env vars might help before process group init.
+        import os
+        os.environ["NCCL_BLOCKING_WAIT"] = "1"
+        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        # Increase default timeout significantly (e.g. 60min) to avoid crash during long validation
+        # Only effective if init_process_group is called AFTER this.
+        # trainer_imm.py calls init_process_group inside __init__.
 
         trainer_cls = get_obj_from_str(configs.trainer.target)
         trainer = trainer_cls(configs)

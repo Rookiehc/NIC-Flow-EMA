@@ -263,8 +263,8 @@ train:
     ldis: 0.1
     llpips: 2.0
     lhr: 0.05           # base weight for HR loss（将通过 loss_coef_schedule 在 2k/5k 后动态调整）
-  timesteps: [250, 200, 150, 100]
-  num_inference_steps: 5
+  timesteps: [250]
+  num_inference_steps: 1
   # mixed precision
   use_amp: True                
   use_fsdp: False                

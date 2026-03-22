@@ -1,4 +1,3 @@
-
 from __future__ import absolute_import
 
 import torch
@@ -130,6 +129,7 @@ class LPIPS(nn.Module):
 
         # v0.0 - original release had a bug, where input was not scaled
         in0_input, in1_input = (self.scaling_layer(in0), self.scaling_layer(in1)) if (not self.latent and self.version=='0.1') else (in0, in1)
+        
         outs0, outs1 = self.net.forward(in0_input), self.net.forward(in1_input)
         feats0, feats1, diffs = {}, {}, {}
 
@@ -138,10 +138,15 @@ class LPIPS(nn.Module):
             diffs[kk] = (feats0[kk]-feats1[kk])**2
 
         if(self.lpips):
-            if(self.spatial):
-                res = [upsample(self.lins[kk](diffs[kk]), out_HW=in0.shape[2:]) for kk in range(self.L)]
-            else:
-                res = [spatial_average(self.lins[kk](diffs[kk]), keepdim=True) for kk in range(self.L)]
+            res = []
+            for kk in range(self.L):
+                dk = diffs[kk]
+                lk = self.lins[kk]
+                out_lk = lk(dk)
+                if(self.spatial):
+                    res.append(upsample(out_lk, out_HW=in0.shape[2:]))
+                else:
+                    res.append(spatial_average(out_lk, keepdim=True))
         else:
             if(self.spatial):
                 res = [upsample(diffs[kk].sum(dim=1,keepdim=True), out_HW=in0.shape[2:]) for kk in range(self.L)]
@@ -149,8 +154,8 @@ class LPIPS(nn.Module):
                 res = [spatial_average(diffs[kk].sum(dim=1,keepdim=True), keepdim=True) for kk in range(self.L)]
 
         val = 0
-        for l in range(self.L):
-            val += res[l]
+        for l in res:
+            val += l
 
         if(retPerLayer):
             return (val, res)

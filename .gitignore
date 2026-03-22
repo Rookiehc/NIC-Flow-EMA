@@ -179,4 +179,9 @@ cython_debug/
 output/
 save_dir/
 weights/
-hub/
+hub/*.pth
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+*.mat
